@@ -1,0 +1,54 @@
+{
+	"name": "pi-subagents-goal",
+	"version": "0.1.0",
+	"description": "Fail-closed autonomous Pi goal loop coordinated with pi-subagents",
+	"type": "module",
+	"private": true,
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"goal",
+		"subagents"
+	],
+	"exports": {
+		".": "./index.ts"
+	},
+	"files": [
+		"index.ts",
+		"src/**/*.ts",
+		"README.md",
+		"LICENSE",
+		"docs/**/*.md"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"check": "npm run format:check && npm run lint && npm run typecheck && npm test",
+		"format": "biome format --write .",
+		"format:check": "biome format .",
+		"lint": "biome lint .",
+		"test": "node --experimental-strip-types --test test/*.test.ts",
+		"test:integration": "node --experimental-strip-types --test test/extension.test.ts",
+		"test:smoke": "node --experimental-strip-types test/smoke/pi-0821-load-smoke.ts && node --experimental-strip-types test/smoke/local-pi-subagents-smoke.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "0.82.1",
+		"@earendil-works/pi-coding-agent": "0.82.1",
+		"typebox": "1.1.38"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.5",
+		"@earendil-works/pi-ai": "0.82.1",
+		"@earendil-works/pi-coding-agent": "0.82.1",
+		"typebox": "1.1.38",
+		"typescript": "6.0.3"
+	}
+}
