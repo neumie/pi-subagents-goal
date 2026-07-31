@@ -2,7 +2,7 @@
 
 ## Scope
 
-This model covers coordination safety for `pi-subagents-goal` running in one Pi process with Pi `0.82.1` and `pi-subagents` `0.38.1`. It does not sandbox child agents or make model output trustworthy.
+This model covers coordination safety for `pi-subagents-goal` running in one Pi process with Pi `0.83.0` and `pi-subagents` `0.38.1`. It does not sandbox child agents or make model output trustworthy.
 
 ## Assets
 
@@ -96,7 +96,7 @@ The prompt makes the reviewer read-only and asks for source-backed findings. Ope
 5. **Model-facing output bounds.** Preview truncation may require manual/session inspection before a truthful acknowledgement.
 6. **Clean-shutdown semantics.** A clean shutdown pauses and permits explicit resume because Pi is expected to abort the active turn. If the host violates that assumption, a user should cancel rather than resume.
 7. **Local upstream availability.** The smoke pins the local commit and requires a clean worktree, but reproducibility still depends on the configured absolute checkout being available (or `PI_SUBAGENTS_LOCAL_PATH` pointing to an equivalent clean checkout).
-8. **Pi shrinkwrap advisory.** Pi 0.82.1 publishes a shrinkwrapped `brace-expansion@5.0.7`, affected by `GHSA-mh99-v99m-4gvg` (high-severity memory-exhaustion DoS). Clean-install testing shows root overrides and `npm audit fix` do not replace it. This extension does not accept brace/minimatch patterns and does not bundle that package, but the host Pi process retains the risk. Remediation requires a target Pi release with `brace-expansion>=5.0.8`.
+8. **Pi shrinkwrap advisory.** Pi 0.83.0 publishes a shrinkwrapped `brace-expansion@5.0.7`, affected by `GHSA-mh99-v99m-4gvg` (high-severity memory-exhaustion DoS). Clean-install testing shows root overrides and `npm audit fix` do not replace it. This extension does not accept brace/minimatch patterns and does not bundle that package, but a clean host Pi package installation retains the risk. Remediation requires a Pi release whose published shrinkwrap selects `brace-expansion>=5.0.8`.
 
 ## Security response
 

@@ -4,7 +4,7 @@ A fail-closed autonomous goal loop for [Pi](https://github.com/badlogic/pi-mono)
 
 The extension owns `/goal`, schedules continuation turns, tracks every delegated item, requires explicit output consumption, and gates completion on a fresh independent review. Its safety properties live in a deterministic state machine rather than prompt convention.
 
-> **Compatibility:** this revision targets exactly Pi `0.82.1`, `typebox` `1.1.38`, Node `>=22.19.0`, and the local `pi-subagents` `0.38.1` contract audited at commit `886bbad929134d7954a4fb34e532d82ac21e33e8`.
+> **Compatibility:** this revision targets exactly Pi `0.83.0`, `typebox` `1.3.7`, Node `>=22.19.0`, and the local `pi-subagents` `0.38.1` contract audited at commit `886bbad929134d7954a4fb34e532d82ac21e33e8`.
 
 ## Status
 
@@ -119,14 +119,14 @@ npm pack --dry-run
 
 `test:smoke` performs two bounded checks without invoking a model:
 
-1. loads the extension with Pi `0.82.1`'s real Jiti loader and verifies its registered surface;
+1. loads the extension with Pi `0.83.0`'s real Jiti loader and verifies its registered surface;
 2. loads the real local `pi-subagents` checkout, proves exact-session RPC and delegation V2 tuple correlation using an intentionally unknown agent, and proves detached coordination is not advertised.
 
 Hosted CI uses Node `22.19.0` to run the locked install, full quality gate, and the first check through `test:smoke:pi`. The second check intentionally remains local because it requires the separately audited checkout identified in `test/smoke/local-pi-subagents-smoke.ts`.
 
 ### Known upstream audit residual
 
-`npm audit` reports `GHSA-mh99-v99m-4gvg` (high severity, unbounded brace expansion) in Pi 0.82.1's shrinkwrapped nested `brace-expansion@5.0.7`. A clean-install experiment confirmed that root overrides and `npm audit fix` cannot replace the nested package. This extension accepts no brace/minimatch input itself and ships no production dependency copy, but the host Pi installation retains the advisory. Resolution requires a Pi release that shrinkwraps `brace-expansion>=5.0.8`; upgrading independently would violate this revision's exact Pi 0.82.1 compatibility target.
+`npm audit` reports `GHSA-mh99-v99m-4gvg` (high severity, unbounded brace expansion) in Pi 0.83.0's shrinkwrapped nested `brace-expansion@5.0.7`. A clean-install experiment confirmed that root overrides and `npm audit fix` cannot replace the nested package. This extension accepts no brace/minimatch input itself and ships no production dependency copy, but a clean host Pi package installation retains the advisory. Resolution requires a Pi release whose published shrinkwrap selects `brace-expansion>=5.0.8`.
 
 See also:
 

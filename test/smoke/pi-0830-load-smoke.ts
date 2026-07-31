@@ -8,7 +8,7 @@ import { GOAL_TOOL_NAMES } from "../../src/extension.ts";
 const projectRoot = resolve(import.meta.dirname, "../..");
 const piPackagePath = resolve(projectRoot, "node_modules/@earendil-works/pi-coding-agent/package.json");
 const piPackage = JSON.parse(await readFile(piPackagePath, "utf8")) as { version?: unknown };
-assert.equal(piPackage.version, "0.82.1", "Smoke must run against exact Pi 0.82.1");
+assert.equal(piPackage.version, "0.83.0", "Smoke must run against exact Pi 0.83.0");
 
 const result = await loadExtensions([resolve(projectRoot, "index.ts")], projectRoot, createEventBus());
 assert.deepEqual(result.errors, []);

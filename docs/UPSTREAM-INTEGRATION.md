@@ -2,7 +2,7 @@
 
 ## Audited versions
 
-- Pi: `@earendil-works/pi-coding-agent` `0.82.1`
+- Pi: `@earendil-works/pi-coding-agent` `0.83.0`
 - local `pi-subagents`: `0.38.1`
 - local commit: `886bbad929134d7954a4fb34e532d82ac21e33e8`
 
@@ -209,7 +209,7 @@ This closes event loss during reload and lets the caller decide whether to pause
 
 ## Minimal Pi core primitive
 
-Provider coordination alone is insufficient for crash-safe exactly-once continuation. Pi `0.82.1` exposes separate `appendEntry()` and `sendMessage()` calls, leaving a crash window between ledger persistence and enqueue.
+Provider coordination alone is insufficient for crash-safe exactly-once continuation. Pi `0.83.0` exposes separate `appendEntry()` and `sendMessage()` calls, leaving a crash window between ledger persistence and enqueue.
 
 A minimal core API could be:
 
