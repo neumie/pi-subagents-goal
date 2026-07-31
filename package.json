@@ -33,7 +33,8 @@
 		"lint": "biome lint .",
 		"test": "node --experimental-strip-types --test test/*.test.ts",
 		"test:integration": "node --experimental-strip-types --test test/extension.test.ts",
-		"test:smoke": "node --experimental-strip-types test/smoke/pi-0821-load-smoke.ts && node --experimental-strip-types test/smoke/local-pi-subagents-smoke.ts",
+		"test:smoke": "npm run test:smoke:pi && node --experimental-strip-types test/smoke/local-pi-subagents-smoke.ts",
+		"test:smoke:pi": "node --experimental-strip-types test/smoke/pi-0821-load-smoke.ts",
 		"typecheck": "tsc --noEmit"
 	},
 	"engines": {
