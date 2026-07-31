@@ -11,9 +11,7 @@ import { SubagentBridge } from "../../src/subagents-bridge.ts";
 const EXPECTED_LOCAL_VERSION = "0.38.1";
 const EXPECTED_LOCAL_COMMIT = "886bbad929134d7954a4fb34e532d82ac21e33e8";
 const projectRoot = resolve(import.meta.dirname, "../..");
-const localRoot = resolve(
-	process.env.PI_SUBAGENTS_LOCAL_PATH ?? "/Users/jakubneumann/Documents/code/neumie/pi-subagents",
-);
+const localRoot = resolve(process.env.PI_SUBAGENTS_LOCAL_PATH ?? resolve(projectRoot, "../pi-subagents"));
 const localEntry = resolve(localRoot, "index.ts");
 const packageJson = JSON.parse(await readFile(resolve(localRoot, "package.json"), "utf8")) as {
 	version?: unknown;

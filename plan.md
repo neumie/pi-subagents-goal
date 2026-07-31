@@ -2,7 +2,7 @@
 
 ## Decision
 
-Build a private Pi 0.83.0 package with no production dependencies beyond Pi's required peers. The extension owns `/goal` and exposes `goal_subagent`, `goal_ack_output`, `goal_resolve`, `goal_review`, and `goal_done`. Parent automatic-turn/no-progress and child execution guards remain finite by default; goal token and wall-clock limits are opt-in, and explicit token limits count newly generated parent output plus delegated usage.
+Build a Git-distributed Pi 0.83.0 package that remains private on npm and has no production dependencies beyond Pi's required peers. The extension owns `/goal` and exposes `goal_subagent`, `goal_ack_output`, `goal_resolve`, `goal_review`, and `goal_done`. Parent automatic-turn/no-progress and child execution guards remain finite by default; goal token and wall-clock limits are opt-in, and explicit token limits count newly generated parent output plus delegated usage.
 
 The current local `pi-subagents` 0.38.1 cannot safely hand detached completion ownership to another extension: it queues its own turn before emitting `subagent:async-complete`. Therefore:
 
@@ -24,7 +24,7 @@ The current local `pi-subagents` 0.38.1 cannot safely hand detached completion o
 - bounded bridge tests for timeout, abort, duplicate/stale responses, parallel, and chain;
 - extension harness tests for namespace collision, direct-subagent blocking, persistence, lifecycle guards, acknowledgement tokens, `goal_done` gates, output-only parent token accounting, status replay, and zero direct UI writes;
 - exact Pi 0.83.0 typecheck and package-load smoke;
-- local `pi-subagents` contract smoke against `/Users/jakubneumann/Documents/code/neumie/pi-subagents`, including foreground delegation V2 and detached fail-closed capability detection;
+- local `pi-subagents` contract smoke against the sibling `../pi-subagents` checkout (or `PI_SUBAGENTS_LOCAL_PATH`), including foreground delegation V2 and detached fail-closed capability detection;
 - format, lint, typecheck, unit/integration tests, `npm pack --dry-run`, and independent review.
 
 ## Completion record
