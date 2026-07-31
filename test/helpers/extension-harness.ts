@@ -77,6 +77,7 @@ export interface Harness {
 	tools: Map<string, RegisteredToolLike>;
 	commands: RegisteredCommandLike[];
 	abortCount: () => number;
+	rpcRequestCount: () => number;
 	emit(name: string, event: Record<string, unknown>): Promise<unknown[]>;
 	start(reason?: "startup" | "resume" | "switch" | "fork" | "tree"): Promise<void>;
 	settle(): Promise<void>;
@@ -148,6 +149,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	let idle = true;
 	let toolSequence = 0;
 	let sendAttempts = 0;
+	let rpcRequests = 0;
 	let activeController: AbortController | undefined;
 
 	if (options.preexistingGoalCommand) {
@@ -215,6 +217,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	registerPiSubagentsGoal(piObject);
 
 	events.on(SUBAGENT_RPC_REQUEST, (raw) => {
+		rpcRequests += 1;
 		const request = record(raw);
 		if (!request || request.version !== SUBAGENT_RPC_VERSION || typeof request.requestId !== "string") return;
 		events.emit(`${SUBAGENT_RPC_REPLY_PREFIX}${request.requestId}`, {
@@ -259,6 +262,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		tools,
 		commands,
 		abortCount: () => aborts,
+		rpcRequestCount: () => rpcRequests,
 		emit,
 		start: async (reason = "startup") => {
 			await emit("session_start", { type: "session_start", reason });

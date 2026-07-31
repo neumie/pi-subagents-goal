@@ -17,6 +17,7 @@ const extension = result.extensions[0];
 assert.ok(extension);
 assert.deepEqual([...extension.tools.keys()].sort(), [...GOAL_TOOL_NAMES].sort());
 assert.deepEqual([...extension.commands.keys()], ["goal"]);
+assert.equal(extension.handlers.has("tool_call"), false, "Ordinary tools must not be intercepted");
 assert.deepEqual(
 	[...extension.handlers.keys()].sort(),
 	[
@@ -30,7 +31,6 @@ assert.deepEqual(
 		"session_before_tree",
 		"session_shutdown",
 		"session_start",
-		"tool_call",
 		"tool_result",
 		"turn_end",
 	].sort(),

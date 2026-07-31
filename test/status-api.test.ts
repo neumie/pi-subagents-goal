@@ -81,6 +81,63 @@ describe("goal status API", () => {
 		assert.doesNotMatch(JSON.stringify(status), /private-progress-digest/u);
 	});
 
+	it("keeps status v1 valid when an advisory review fails before completion", () => {
+		const target = machine();
+		target.admitWork({
+			itemId: "advisory-review",
+			mode: "single",
+			role: "review",
+			label: "Advisory review",
+			now: NOW + 1,
+		});
+		target.startWork(target.snapshot.owner, "advisory-review", NOW + 2);
+		const ackToken = "advisory-ack-token";
+		target.terminalWork({
+			owner: target.snapshot.owner,
+			itemId: "advisory-review",
+			outcome: "succeeded",
+			output: "Found a concern",
+			ackToken,
+			now: NOW + 3,
+		});
+		target.recordReview({
+			owner: target.snapshot.owner,
+			itemId: "advisory-review",
+			verdict: "fail",
+			workGeneration: target.snapshot.workGeneration,
+			findings: "Advisory concern",
+			now: NOW + 4,
+		});
+		target.markOutputSurfaced(target.snapshot.owner, ["advisory-review"], NOW + 5);
+		target.acknowledgeOutput({
+			owner: target.snapshot.owner,
+			itemId: "advisory-review",
+			ackToken,
+			consideration: "Considered the advisory concern",
+			now: NOW + 6,
+		});
+		assert.equal(
+			target.complete({
+				owner: target.snapshot.owner,
+				consideredItemIds: ["advisory-review"],
+				now: NOW + 7,
+			}).ok,
+			true,
+		);
+
+		const status = createGoalStatusEnvelope({
+			providerId: "provider-1",
+			sequence: 5,
+			sessionId: "session-private",
+			objective: "Verify advisory status",
+			snapshot: target.snapshot,
+		});
+		assert.equal(status.version, 1);
+		assert.equal(status.goal?.phase, "completed");
+		assert.equal(status.goal?.live, false);
+		assert.equal(status.goal?.review, "fail");
+	});
+
 	it("represents an idle provider and bounds provider errors", () => {
 		const status = createGoalStatusEnvelope({
 			providerId: "provider-1",

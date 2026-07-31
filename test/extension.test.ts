@@ -21,10 +21,9 @@ interface GoalIdentity {
 }
 
 interface GoalResultDetails extends GoalIdentity {
-	version: 1;
+	version: 2;
 	itemIds: string[];
 	acknowledgements: Array<{ itemId: string; ackToken: string }>;
-	reviewToken?: string;
 	verdict?: "pass" | "fail";
 }
 
@@ -65,13 +64,19 @@ async function startGoal(harness: Harness, objective = "Complete safely"): Promi
 	const content = String(harness.sentMessages[1]?.message.content);
 	assert.ok(content.includes(`goalId: ${owner.goalId}`));
 	assert.ok(content.includes(`epoch: ${owner.epoch}`));
-	assert.match(content, /prose-free goal_ack_output-only turn/u);
+	assert.match(content, /Work directly with ordinary tools/u);
+	assert.match(content, /goal_review are optional/u);
+	assert.doesNotMatch(content, /prose-free goal_ack_output-only turn/u);
 	return owner;
 }
 
-async function markInitialTurnRunning(harness: Harness): Promise<void> {
+async function markLatestGoalTurnRunning(harness: Harness): Promise<void> {
+	const prompt = String(harness.sentMessages.at(-1)?.message.content ?? "");
+	await harness.emit("before_agent_start", { type: "before_agent_start", prompt, systemPrompt: "BASE" });
 	await harness.emit("agent_start", { type: "agent_start" });
 }
+
+const markInitialTurnRunning = markLatestGoalTurnRunning;
 
 async function acknowledge(harness: Harness, owner: GoalIdentity, result: GoalResultDetails): Promise<void> {
 	await harness.callTool("goal_ack_output", {
@@ -105,19 +110,29 @@ describe("Pi extension registration and ownership", () => {
 			"goal_subagent",
 		]);
 		assert.equal(harness.commands.filter((command) => command.name === "goal").length, 1);
+		const doneSchema = record(record(harness.tools.get("goal_done")).parameters);
+		const doneProperties = record(doneSchema.properties);
+		assert.equal("reviewToken" in doneProperties, true);
+		assert.equal(Array.isArray(doneSchema.required) && doneSchema.required.includes("reviewToken"), false);
 		await harness.start();
 	});
 
-	it("surfaces exact identity and post-review sequencing to the parent", async () => {
+	it("surfaces exact identity and optional pi-subagents guidance to the parent", async () => {
 		const harness = createHarness();
 		const owner = await startGoal(harness);
-		const rewrites = await harness.emit("before_agent_start", { systemPrompt: "BASE" });
+		const rewrites = await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: String(harness.sentMessages.at(-1)?.message.content ?? ""),
+			systemPrompt: "BASE",
+		});
 		const rewrite = record(rewrites.find((value) => value !== undefined));
 		const prompt = String(rewrite.systemPrompt);
 		assert.ok(prompt.includes(`Goal ID: ${owner.goalId}`));
 		assert.ok(prompt.includes(`Goal epoch: ${owner.epoch}`));
-		assert.match(prompt, /tool-only assistant turn/u);
-		assert.match(prompt, /any other post-review content invalidates the review/u);
+		assert.match(prompt, /Work directly with ordinary tools/u);
+		assert.match(prompt, /pi-subagents and its goal-owned tools are optional/u);
+		assert.match(prompt, /No review token is required/u);
+		assert.doesNotMatch(prompt, /Direct subagent calls are blocked/u);
 	});
 
 	it("fails closed on a preexisting command or tool namespace", async () => {
@@ -173,29 +188,18 @@ describe("Pi extension registration and ownership", () => {
 		assert.equal(harness.statuses.size, 0);
 	});
 
-	it("blocks only direct subagent calls while a live goal owns delegation", async () => {
+	it("does not intercept ordinary subagent or other tool calls", async () => {
 		const harness = createHarness();
 		await startGoal(harness);
-		const blocked = await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "direct",
-			toolName: "subagent",
-			input: {},
-		});
-		assert.deepEqual(blocked, [
-			{
-				block: true,
-				reason:
-					"Direct subagent calls are blocked during /goal because the current pi-subagents contract cannot atomically bind them to this session/lineage/goal/epoch. Use goal_subagent foreground mode.",
-			},
-		]);
-		const unrelated = await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "read",
-			toolName: "read",
-			input: {},
-		});
-		assert.deepEqual(unrelated, [undefined]);
+		for (const toolName of ["subagent", "read"]) {
+			const results = await harness.emit("tool_call", {
+				type: "tool_call",
+				toolCallId: `direct-${toolName}`,
+				toolName,
+				input: {},
+			});
+			assert.deepEqual(results, []);
+		}
 	});
 
 	it("requires exact goal and epoch identity on goal_subagent", async () => {
@@ -216,7 +220,7 @@ describe("Pi extension registration and ownership", () => {
 });
 
 describe("foreground goal flow", () => {
-	it("runs work, consumes exact output, obtains fresh review, and completes", async () => {
+	it("optionally runs owned work and review before completing", async () => {
 		const harness = createHarness();
 		const owner = await startGoal(harness, "Implement and verify");
 		await markInitialTurnRunning(harness);
@@ -246,7 +250,7 @@ describe("foreground goal flow", () => {
 			),
 		);
 		assert.equal(review.verdict, "pass");
-		assert.equal(typeof review.reviewToken, "string");
+		assert.equal("reviewToken" in review, false);
 		await acknowledge(harness, owner, review);
 
 		const done = await harness.callTool(
@@ -254,8 +258,7 @@ describe("foreground goal flow", () => {
 			{
 				goalId: owner.goalId,
 				epoch: owner.epoch,
-				summary: "Implemented and independently verified.",
-				reviewToken: review.reviewToken,
+				summary: "Implemented with optional independent advice.",
 				consideredItemIds: [...work.itemIds, ...review.itemIds],
 			},
 			"done-call",
@@ -270,7 +273,7 @@ describe("foreground goal flow", () => {
 			toolName: "subagent",
 			input: {},
 		});
-		assert.deepEqual(directAfterCompletion, [undefined]);
+		assert.deepEqual(directAfterCompletion, []);
 	});
 
 	it("applies batched output acknowledgements atomically", async () => {
@@ -353,46 +356,28 @@ describe("foreground goal flow", () => {
 		assert.equal(latestSnapshot(harness).work.length, 0);
 	});
 
-	it("rejects review acknowledgement and goal_done in the same assistant batch", async () => {
-		const harness = createHarness();
-		const owner = await startGoal(harness);
-		await markInitialTurnRunning(harness);
-		const review = details(
-			await harness.callTool("goal_review", { goalId: owner.goalId, epoch: owner.epoch }, "review-call"),
-		);
-		await acknowledge(harness, owner, review);
-		const doneTool = harness.tools.get("goal_done");
-		assert.ok(doneTool);
-		harness.branch.push({
-			type: "message",
-			message: {
-				role: "assistant",
-				content: [
-					{ type: "toolCall", id: "sibling-ack", name: "goal_ack_output", arguments: {} },
-					{ type: "toolCall", id: "sibling-done", name: "goal_done", arguments: {} },
-				],
+	it("starts and completes without contacting pi-subagents or requiring review", async () => {
+		let providerCalls = 0;
+		const harness = createHarness({
+			provider: () => {
+				providerCalls += 1;
 			},
 		});
-		await assert.rejects(
-			() =>
-				doneTool.execute(
-					"sibling-done",
-					{
-						goalId: owner.goalId,
-						epoch: owner.epoch,
-						summary: "done",
-						reviewToken: review.reviewToken,
-						consideredItemIds: review.itemIds,
-					},
-					new AbortController().signal,
-					() => undefined,
-					harness.ctx,
-				),
-			/work occurred after independent review/u,
-		);
+		const owner = await startGoal(harness, "Complete directly");
+		await markInitialTurnRunning(harness);
+		const done = await harness.callTool("goal_done", {
+			goalId: owner.goalId,
+			epoch: owner.epoch,
+			summary: "Completed directly with ordinary tools.",
+			consideredItemIds: [],
+		});
+		assert.equal(done.terminate, true);
+		assert.equal(latestSnapshot(harness).phase, "completed");
+		assert.equal(providerCalls, 0);
+		assert.equal(harness.rpcRequestCount(), 0);
 	});
 
-	it("invalidates review evidence when prose is bundled with an allowed goal call", async () => {
+	it("keeps an optional review advisory after later ordinary work", async () => {
 		const harness = createHarness();
 		const owner = await startGoal(harness);
 		await markInitialTurnRunning(harness);
@@ -402,60 +387,8 @@ describe("foreground goal flow", () => {
 		await acknowledge(harness, owner, review);
 		harness.branch.push({
 			type: "message",
-			message: {
-				role: "assistant",
-				content: [
-					{ type: "text", text: "post-review prose" },
-					{ type: "toolCall", id: "allowed-ack", name: "goal_ack_output", arguments: {} },
-				],
-			},
+			message: { role: "user", content: [{ type: "text", text: "Use this later evidence too." }] },
 		});
-		await assert.rejects(
-			() =>
-				harness.callTool("goal_done", {
-					goalId: owner.goalId,
-					epoch: owner.epoch,
-					summary: "done",
-					reviewToken: review.reviewToken,
-					consideredItemIds: review.itemIds,
-				}),
-			/work occurred after independent review/u,
-		);
-	});
-
-	it("invalidates review evidence after a later user message", async () => {
-		const harness = createHarness();
-		const owner = await startGoal(harness);
-		await markInitialTurnRunning(harness);
-		const review = details(
-			await harness.callTool("goal_review", { goalId: owner.goalId, epoch: owner.epoch }, "review-call"),
-		);
-		await acknowledge(harness, owner, review);
-		harness.branch.push({
-			type: "message",
-			message: { role: "user", content: [{ type: "text", text: "The requirements have changed." }] },
-		});
-		await assert.rejects(
-			() =>
-				harness.callTool("goal_done", {
-					goalId: owner.goalId,
-					epoch: owner.epoch,
-					summary: "done",
-					reviewToken: review.reviewToken,
-					consideredItemIds: review.itemIds,
-				}),
-			/work occurred after independent review/u,
-		);
-	});
-
-	it("invalidates review evidence after any non-goal tool work", async () => {
-		const harness = createHarness();
-		const owner = await startGoal(harness);
-		await markInitialTurnRunning(harness);
-		const review = details(
-			await harness.callTool("goal_review", { goalId: owner.goalId, epoch: owner.epoch }, "review-call"),
-		);
-		await acknowledge(harness, owner, review);
 		harness.branch.push({
 			type: "message",
 			message: {
@@ -463,31 +396,52 @@ describe("foreground goal flow", () => {
 				content: [{ type: "toolCall", id: "late-read", name: "read", arguments: {} }],
 			},
 		});
-		harness.branch.push({
-			type: "message",
-			message: {
-				role: "toolResult",
-				toolCallId: "late-read",
-				toolName: "read",
-				content: [{ type: "text", text: "late evidence" }],
-				isError: false,
-			},
+		const done = await harness.callTool("goal_done", {
+			goalId: owner.goalId,
+			epoch: owner.epoch,
+			summary: "Completed after considering optional review and later evidence.",
+			consideredItemIds: review.itemIds,
 		});
-		await assert.rejects(
-			() =>
-				harness.callTool("goal_done", {
-					goalId: owner.goalId,
-					epoch: owner.epoch,
-					summary: "done",
-					reviewToken: review.reviewToken,
-					consideredItemIds: review.itemIds,
-				}),
-			/work occurred after independent review/u,
-		);
+		assert.equal(done.terminate, true);
+		assert.equal(latestSnapshot(harness).phase, "completed");
 	});
 });
 
 describe("continuation races", () => {
+	it("does not let an ordinary foreign turn consume a queued goal continuation", async () => {
+		const harness = createHarness();
+		await startGoal(harness);
+		const queued = latestSnapshot(harness).continuation;
+		assert.equal(queued?.status, "queued");
+
+		const rewrites = await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "An ordinary detached subagent completed.",
+			systemPrompt: "BASE",
+		});
+		assert.deepEqual(rewrites, [undefined]);
+		await harness.emit("agent_start", { type: "agent_start" });
+		await harness.emit("turn_end", {
+			type: "turn_end",
+			message: { usage: { output: 99 }, content: [{ type: "text", text: "foreign" }] },
+			toolResults: [],
+		});
+		await harness.emit("agent_end", {
+			type: "agent_end",
+			messages: [{ role: "custom", customType: "subagent-notify", content: "done" }],
+		});
+		await harness.emit("agent_settled", { type: "agent_settled" });
+
+		const afterForeign = latestSnapshot(harness);
+		assert.equal(afterForeign.phase, "active");
+		assert.equal(afterForeign.continuation?.status, "queued");
+		assert.equal(afterForeign.budgetUsage.tokens, 0);
+		assert.equal(harness.sentMessages.length, 2);
+
+		await markLatestGoalTurnRunning(harness);
+		assert.equal(latestSnapshot(harness).continuation?.status, "running");
+	});
+
 	it("counts only new parent output and leaves the token cap disabled", async () => {
 		const harness = createHarness();
 		await startGoal(harness);
@@ -548,7 +502,7 @@ describe("continuation races", () => {
 		);
 		await harness.settle();
 		assert.equal(harness.sentMessages.length, 3);
-		await harness.emit("agent_start", { type: "agent_start" });
+		await markLatestGoalTurnRunning(harness);
 		await harness.emit("agent_start", { type: "agent_start" });
 		await harness.emit("agent_end", { type: "agent_end", messages: staleMessages });
 		await harness.emit("agent_settled", { type: "agent_settled" });
@@ -682,7 +636,7 @@ describe("session lifecycle", () => {
 			toolName: "subagent",
 			input: {},
 		});
-		assert.equal(record(direct[0]).block, true);
+		assert.deepEqual(direct, []);
 		await restored.command("resume");
 		assert.equal(restored.sentMessages.length, 1);
 
@@ -694,7 +648,7 @@ describe("session lifecycle", () => {
 			toolName: "subagent",
 			input: {},
 		});
-		assert.deepEqual(unblocked, [undefined]);
+		assert.deepEqual(unblocked, []);
 		assert.deepEqual(forked.notifications, []);
 	});
 

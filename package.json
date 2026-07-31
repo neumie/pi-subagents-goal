@@ -1,7 +1,7 @@
 {
 	"name": "pi-subagents-goal",
-	"version": "0.1.0",
-	"description": "Fail-closed autonomous Pi goal loop coordinated with pi-subagents",
+	"version": "0.2.0",
+	"description": "Autonomous Pi goal loop with optional fail-closed pi-subagents coordination",
 	"type": "module",
 	"private": true,
 	"license": "MIT",

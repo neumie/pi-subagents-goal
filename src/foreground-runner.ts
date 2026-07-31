@@ -70,7 +70,7 @@ export interface GoalRunResult {
 	items: GoalWorkResult[];
 	text: string;
 	details: {
-		version: 1;
+		version: 2;
 		goalId: string;
 		epoch: number;
 		lineageId: string;
@@ -80,7 +80,6 @@ export interface GoalRunResult {
 }
 
 export interface GoalReviewResult extends GoalWorkResult {
-	reviewToken: string;
 	verdict: "pass" | "fail";
 	findings: unknown[];
 }
@@ -213,7 +212,6 @@ export class GoalSubagentRunner {
 	async review(input: {
 		focus: string;
 		objective: string;
-		toolCallId: string;
 		signal: AbortSignal | undefined;
 		cwd: string;
 		agent?: string;
@@ -240,12 +238,12 @@ export class GoalSubagentRunner {
 			task: {
 				agent: input.agent?.trim() || "reviewer",
 				task: [
-					"Perform a fresh independent completion review. Do not modify files.",
+					"Perform a fresh independent advisory review. Do not modify files.",
 					`Goal: ${input.objective}`,
 					`Focus: ${input.focus.trim() || "Correctness, races, compatibility, tests, and unresolved blockers."}`,
 					"Inspect the repository and current diff directly. Return verdict=pass only when no blocker remains. Return every finding with severity, issue, rationale, and optional file.",
 				].join("\n\n"),
-				label: "Independent completion review",
+				label: "Independent advisory review",
 			},
 			result: { kind: "structured", schema: reviewSchema() },
 			workGeneration,
@@ -259,7 +257,6 @@ export class GoalSubagentRunner {
 		);
 		const structured =
 			result.response.result?.kind === "structured" ? validReview(result.response.result.value) : undefined;
-		const reviewToken = this.#newToken();
 		const verdict = structured?.verdict ?? "fail";
 		const findings = structured?.findings ?? [
 			{
@@ -272,16 +269,14 @@ export class GoalSubagentRunner {
 			machine.recordReview({
 				owner: machine.snapshot.owner,
 				itemId: item.itemId,
-				reviewToken,
 				verdict,
 				workGeneration,
-				toolCallId: input.toolCallId,
 				findings: JSON.stringify(findings),
 				now: this.#now(),
 			});
 			this.#onStateChange();
 		}
-		return { ...result, reviewToken, verdict, findings };
+		return { ...result, verdict, findings };
 	}
 
 	#prepare(params: GoalSubagentParams, role: WorkRole) {
@@ -524,7 +519,7 @@ export class GoalSubagentRunner {
 			items,
 			text,
 			details: {
-				version: 1,
+				version: 2,
 				goalId: owner.goalId,
 				epoch: owner.epoch,
 				lineageId: owner.lineageId,

@@ -190,12 +190,10 @@ describe("GoalSubagentRunner", () => {
 		const review = await runner.review({
 			focus: "races",
 			objective: "Finish",
-			toolCallId: "tool-review",
 			signal: undefined,
 			cwd: "/repo",
 		});
 		assert.equal(review.verdict, "pass");
-		assert.equal(review.reviewToken, "token-2");
 		assert.equal(machine.snapshot.review?.itemId, "item-1");
 		assert.equal(machine.snapshot.review?.workGeneration, 0);
 	});
@@ -211,7 +209,6 @@ describe("GoalSubagentRunner", () => {
 				runner.review({
 					focus: "all",
 					objective: "Finish",
-					toolCallId: "review",
 					signal: undefined,
 					cwd: "/repo",
 				}),

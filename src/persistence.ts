@@ -3,7 +3,7 @@ import { GoalInvariantError, GoalMachine, sha256, type GoalSnapshot } from "./st
 export const GOAL_STATE_ENTRY = "pi-subagents-goal/state-v1";
 export const GOAL_OBJECTIVE_MESSAGE = "pi-subagents-goal/objective-v1";
 export const GOAL_CONTINUATION_MESSAGE = "pi-subagents-goal/continuation-v1";
-export const GOAL_TOOL_DETAILS_VERSION = 1 as const;
+export const GOAL_TOOL_DETAILS_VERSION = 2 as const;
 
 export interface SessionIdentity {
 	sessionId: string;

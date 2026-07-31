@@ -6,9 +6,9 @@
 - local `pi-subagents`: `0.38.1`
 - local commit: `886bbad929134d7954a4fb34e532d82ac21e33e8`
 
-The repository was inspected read-only. No upstream or global Pi files are modified by this project.
+The repository was inspected read-only. No upstream or global Pi files are modified by this project. This contract applies only when the parent opts into `goal_subagent` or `goal_review`; the core goal loop does not probe or require `pi-subagents`, and ordinary `subagent` calls, when the tool is installed, remain upstream-owned and unrestricted.
 
-## Why current detached work is rejected
+## Why current goal-owned detached work is rejected
 
 Current `pi-subagents` detached completion has two channels with different authority:
 
@@ -58,7 +58,7 @@ V2 adds `ownerRunId` and `nodeId`. `pi-subagents-goal` additionally correlates t
 protocol version + request ID + ownerRunId + nodeId
 ```
 
-The caller waits for the terminal response and remains the only component deciding whether to enqueue another parent turn. That is why single, parallel, chain, and review foreground paths are supported.
+The caller waits for the terminal response and remains the only component deciding whether to enqueue another parent turn. That is why optional goal-owned single, parallel, chain, and review foreground paths are supported.
 
 ## Existing RPC evidence
 
@@ -241,4 +241,4 @@ Detached mode remains rejected until **both** are true:
 1. `pi-subagents` advertises and satisfies `goalCoordination v1` with caller-owned notification, replay, cancellation, and output acknowledgement;
 2. Pi offers an atomic/idempotent continuation enqueue or another mechanism proving exactly-one recovery.
 
-Unknown versions, partial capabilities, malformed channels, mismatched sessions, or missing methods fail closed. Foreground delegation remains the supported path in the meantime.
+Unknown versions, partial capabilities, malformed channels, mismatched sessions, or missing methods fail closed for the optional goal-owned adapter. The parent loop and ordinary tools remain available; optional goal-owned foreground delegation is the supported coordinated path in the meantime.

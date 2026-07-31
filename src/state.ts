@@ -99,10 +99,8 @@ export interface ContinuationState {
 
 export interface ReviewEvidence {
 	itemId: string;
-	reviewToken: string;
 	verdict: "pass" | "fail";
 	workGeneration: number;
-	toolCallId: string;
 	findingsDigest: string;
 }
 
@@ -150,9 +148,7 @@ export interface WorkTerminal {
 
 export interface CompletionRequest {
 	owner: OwnerIdentity;
-	reviewToken: string;
 	consideredItemIds: string[];
-	reviewIsCurrent: boolean;
 	now: number;
 }
 
@@ -330,13 +326,16 @@ export class GoalMachine {
 		return structuredClone(ticket);
 	}
 
-	agentStarted(now: number): boolean {
+	agentStarted(now: number, continuationNonce?: string): boolean {
 		if (this.#state.phase !== "active") return false;
 		const continuation = this.#state.continuation;
 		if (continuation?.status === "running" || (!continuation && !this.#state.parentSettled)) {
 			return false;
 		}
-		if (continuation?.status === "reserved") delete this.#state.continuation;
+		if (continuation?.status === "reserved") return false;
+		if (continuation?.status === "queued" && !safeTokenEqual(continuationNonce, continuation.ticket.nonce)) {
+			return false;
+		}
 		const queued = this.#state.continuation;
 		if (queued?.status === "queued") {
 			queued.status = "running";
@@ -562,10 +561,8 @@ export class GoalMachine {
 	recordReview(input: {
 		owner: OwnerIdentity;
 		itemId: string;
-		reviewToken: string;
 		verdict: "pass" | "fail";
 		workGeneration: number;
-		toolCallId: string;
 		findings: string;
 		now: number;
 	}): boolean {
@@ -579,10 +576,8 @@ export class GoalMachine {
 		}
 		this.#state.review = {
 			itemId: input.itemId,
-			reviewToken: input.reviewToken,
 			verdict: input.verdict,
 			workGeneration: input.workGeneration,
-			toolCallId: input.toolCallId,
 			findingsDigest: sha256(input.findings),
 		};
 		this.#touch(input.now);
@@ -653,15 +648,6 @@ export class GoalMachine {
 			blockers.push(`completion included unknown work items: ${unexpected.join(", ")}`);
 		if (considered.size !== input.consideredItemIds.length)
 			blockers.push("completion repeated work item IDs");
-		const review = this.#state.review;
-		if (!review) blockers.push("independent review evidence is missing");
-		else {
-			if (!safeTokenEqual(review.reviewToken, input.reviewToken))
-				blockers.push("review token does not match");
-			if (review.verdict !== "pass") blockers.push("independent review did not pass");
-			if (review.workGeneration !== this.#state.workGeneration) blockers.push("independent review is stale");
-			if (!input.reviewIsCurrent) blockers.push("work occurred after independent review");
-		}
 		return { ok: blockers.length === 0, blockers };
 	}
 
@@ -985,8 +971,8 @@ export class GoalMachine {
 					item.outputState !== "consumed" ||
 					(item.state !== "succeeded" && !item.resolutionDigest),
 			);
-			if (incomplete || this.#state.review?.verdict !== "pass") {
-				throw new GoalInvariantError("Completed goal lacks complete work and review evidence.");
+			if (incomplete) {
+				throw new GoalInvariantError("Completed goal contains incomplete goal-owned work.");
 			}
 		}
 	}
@@ -1040,11 +1026,9 @@ export class GoalMachine {
 		if (!isRecord(value)) throw new GoalInvariantError("Persisted review evidence is invalid.");
 		if (
 			!validWireValue(value.itemId) ||
-			!validWireValue(value.reviewToken) ||
 			(value.verdict !== "pass" && value.verdict !== "fail") ||
 			!isSafeCounter(value.workGeneration) ||
 			value.workGeneration !== this.#state.workGeneration ||
-			!validWireValue(value.toolCallId) ||
 			!isDigest(value.findingsDigest)
 		) {
 			throw new GoalInvariantError("Persisted review evidence fields are invalid.");
