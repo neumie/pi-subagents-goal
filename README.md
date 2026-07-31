@@ -122,6 +122,8 @@ npm pack --dry-run
 1. loads the extension with Pi `0.82.1`'s real Jiti loader and verifies its registered surface;
 2. loads the real local `pi-subagents` checkout, proves exact-session RPC and delegation V2 tuple correlation using an intentionally unknown agent, and proves detached coordination is not advertised.
 
+Hosted CI uses Node `22.19.0` to run the locked install, full quality gate, and the first check through `test:smoke:pi`. The second check intentionally remains local because it requires the separately audited checkout identified in `test/smoke/local-pi-subagents-smoke.ts`.
+
 ### Known upstream audit residual
 
 `npm audit` reports `GHSA-mh99-v99m-4gvg` (high severity, unbounded brace expansion) in Pi 0.82.1's shrinkwrapped nested `brace-expansion@5.0.7`. A clean-install experiment confirmed that root overrides and `npm audit fix` cannot replace the nested package. This extension accepts no brace/minimatch input itself and ships no production dependency copy, but the host Pi installation retains the advisory. Resolution requires a Pi release that shrinkwraps `brace-expansion>=5.0.8`; upgrading independently would violate this revision's exact Pi 0.82.1 compatibility target.
