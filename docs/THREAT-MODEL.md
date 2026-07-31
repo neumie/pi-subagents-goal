@@ -55,7 +55,7 @@ A malicious extension loaded into the same Pi process is inside the trust bounda
 | Model invents acknowledgement | Timing-safe comparison with a random exact token and item ID |
 | Failure treated as success | Terminal state is immutable; `goal_resolve` records rationale but does not rewrite outcome |
 | Optional provider is absent | Core startup and `goal_done` never probe it; only `goal_subagent` or `goal_review` returns an actionable compatibility error |
-| Installed ordinary subagent bypasses ledger | Allowed and documented as unowned; queued goal transitions require the exact initiating nonce at both start and end, so a foreign completion turn cannot consume the goal ticket or mutate its budget/settlement state |
+| Installed ordinary subagent bypasses ledger | Allowed and documented as unowned; only `message_start` for the exact owner/ticket/content-bound custom continuation or an exact nonce-tagged prompt can start the queued goal turn, and the same nonce must be present at end; preceding foreign turns remain excluded from goal budget and settlement state |
 | Current goal-owned detached completion races extension | `goal_subagent execution=detached` is rejected before admission |
 | Fork inherits authority | Exact session ID/file validation; switch/fork/tree blocked while live |
 | Unsafe compaction removes evidence | Compaction blocked with nonterminal work or unconsumed output |

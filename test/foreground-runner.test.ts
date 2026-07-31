@@ -73,6 +73,21 @@ describe("GoalSubagentRunner", () => {
 		assert.equal(machine.snapshot.budgetUsage.tokens, 15);
 	});
 
+	it("notifies persistence when work admission faults against a queued continuation", async () => {
+		const port: ForegroundPort = {
+			runForeground: async (request) => completed(request),
+		};
+		const { machine, runner, changes } = setup(port);
+		machine.queueInitialContinuation(150);
+
+		await assert.rejects(
+			() => runner.run({ agent: "worker", task: "Must not launch" }, undefined, "/repo"),
+			/New work appeared after a continuation was queued/u,
+		);
+		assert.equal(machine.snapshot.phase, "faulted");
+		assert.equal(changes(), 1);
+	});
+
 	it("bounds multibyte aggregate output by UTF-8 bytes without truncating acknowledgement tokens", async () => {
 		const port: ForegroundPort = {
 			runForeground: async (request, _signal, callbacks) => {
