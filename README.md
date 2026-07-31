@@ -61,6 +61,8 @@ Starting a goal appends a digest-bound objective message and a value-free state 
 - **`goal_review`** — launches a fresh read-only structured reviewer after all prior work is terminal, consumed, and resolved.
 - **`goal_done`** — completes only when all ledger items are included, all output is consumed, unsuccessful work is resolved, budgets remain, and current independent review evidence passes.
 
+Every continuation repeats the exact goal ID and epoch so the parent never needs to inspect environment variables, session artifacts, or ambient process state. After a passing review, its acknowledgement and `goal_done` must occur in separate tool-only assistant turns with no prose or other tool calls; any other post-review content deliberately invalidates the review.
+
 Example foreground call shape:
 
 ```json
