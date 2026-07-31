@@ -1,33 +1,38 @@
 # pi-subagents-goal
 
-A fail-closed autonomous goal loop for [Pi](https://github.com/badlogic/pi-mono) that delegates only through `pi-subagents` work carrying explicit goal ownership.
+An autonomous goal loop for [Pi](https://github.com/badlogic/pi-mono) with optional, fail-closed coordination for goal-owned `pi-subagents` work.
 
-The extension owns `/goal`, schedules continuation turns, tracks every delegated item, requires explicit output consumption, and gates completion on a fresh independent review. Its safety properties live in a deterministic state machine rather than prompt convention.
+The extension owns `/goal` and schedules continuation turns while the parent works directly with any ordinary tools. `pi-subagents`, `goal_subagent`, and independent review are optional; strict lifecycle, acknowledgement, and resolution gates apply only to work explicitly launched through the goal-owned tools.
 
-> **Compatibility:** this revision targets exactly Pi `0.83.0`, `typebox` `1.3.7`, Node `>=22.19.0`, and the local `pi-subagents` `0.38.1` contract audited at commit `886bbad929134d7954a4fb34e532d82ac21e33e8`.
+> **Compatibility:** the core goal loop targets exactly Pi `0.83.0`, `typebox` `1.3.7`, and Node `>=22.19.0`. Optional goal-owned delegation targets `pi-subagents` `0.38.1` at audited commit `886bbad929134d7954a4fb34e532d82ac21e33e8`.
 
 ## Status
 
 | Capability | Status |
 | --- | --- |
-| Foreground single delegation | Supported through delegation V2 |
-| Foreground parallel delegation | Supported, maximum concurrency 4 |
-| Foreground chain delegation | Supported, `{previous}` substitution |
-| Structured independent review | Supported through delegation V2 |
-| Detached/background delegation | Rejected fail-closed on current upstream |
+| Direct work with ordinary Pi tools | Supported; default path |
+| Ordinary `subagent` calls, when that tool is installed | Supported; outside the goal-owned ledger |
+| Goal-owned single/parallel/chain delegation | Optional through delegation V2 |
+| Structured independent review | Optional advisory evidence |
+| Goal-owned detached/background delegation | Rejected fail-closed on current upstream |
 | Session switch/fork/tree during a live goal | Blocked |
-| Compaction with active or unread child work | Blocked |
-| Reload with ambiguous child/continuation state | Faulted, never retried automatically |
+| Compaction with active or unread goal-owned work | Blocked |
+| Reload with ambiguous goal-owned work/continuation state | Faulted, never retried automatically |
 
-Detached work is intentionally unavailable. `pi-subagents` currently queues its own completion turn before publishing its observer event, so a downstream extension cannot be the sole continuation owner. See [`docs/UPSTREAM-INTEGRATION.md`](docs/UPSTREAM-INTEGRATION.md).
+Only detached work launched through `goal_subagent` is intentionally unavailable. When installed, ordinary `subagent` remains untouched and follows its own upstream lifecycle outside this extension's guarantees. `pi-subagents` currently queues its own detached completion turn before publishing its observer event, so the optional goal-owned adapter cannot safely become sole continuation owner. See [`docs/UPSTREAM-INTEGRATION.md`](docs/UPSTREAM-INTEGRATION.md).
 
 ## Installation
 
-Install the audited [`pi-subagents`](https://github.com/neumie/pi-subagents) revision, then install this repository through Pi:
+Install the goal loop through Pi; it works without `pi-subagents`:
+
+```bash
+pi install git:github.com/neumie/pi-subagents-goal
+```
+
+Optionally install the audited [`pi-subagents`](https://github.com/neumie/pi-subagents) revision to enable `goal_subagent` and `goal_review`:
 
 ```bash
 pi install git:github.com/neumie/pi-subagents@886bbad929134d7954a4fb34e532d82ac21e33e8
-pi install git:github.com/neumie/pi-subagents-goal
 ```
 
 For development from a local checkout:
@@ -60,13 +65,17 @@ Starting a goal appends a digest-bound objective message and a value-free state 
 
 ### Goal-owned tools
 
-- **`goal_subagent`** — foreground single, parallel, or chain delegation. Requires the exact `goalId` and `epoch` shown in the goal prompt. Ordinary `subagent` calls are blocked while goal authority is live.
-- **`goal_ack_output`** — consumes child output using its exact one-time acknowledgement token plus a non-empty consideration statement.
-- **`goal_resolve`** — records an explicit rationale for an acknowledged unsuccessful terminal outcome. It never rewrites failure as success.
-- **`goal_review`** — launches a fresh read-only structured reviewer after all prior work is terminal, consumed, and resolved.
-- **`goal_done`** — completes only when all ledger items are included, all output is consumed, unsuccessful work is resolved, budgets remain, and current independent review evidence passes.
+- **`goal_subagent`** — optional foreground single, parallel, or chain delegation with exact goal ownership. When installed, ordinary `subagent` remains available and untracked by the goal ledger.
+- **`goal_ack_output`** — consumes output from `goal_subagent` or `goal_review` using its exact one-time acknowledgement token plus a non-empty consideration statement.
+- **`goal_resolve`** — records an explicit rationale for an acknowledged unsuccessful goal-owned outcome. It never rewrites failure as success.
+- **`goal_review`** — optionally launches a read-only structured reviewer after prior goal-owned work is terminal, consumed, and resolved. Its verdict is advisory rather than a completion gate.
+- **`goal_done`** — completes when enabled budgets remain and every goal-owned item, if any, is included, terminal, consumed, and explicitly resolved when unsuccessful. No subagent or review is required.
 
-Every continuation repeats the exact goal ID and epoch so the parent never needs to inspect environment variables, session artifacts, or ambient process state. After a passing review, its acknowledgement and `goal_done` must occur in separate tool-only assistant turns with no prose or other tool calls; any other post-review content deliberately invalidates the review.
+Every continuation repeats the exact goal ID and epoch so the parent never needs to inspect environment variables, session artifacts, or ambient process state. A direct-only goal calls `goal_done` with an empty `consideredItemIds` list. If optional goal-owned tools are used, their exact item IDs and acknowledgement lifecycle remain mandatory.
+
+### 0.2 migration
+
+Version 0.2 removes mandatory delegation and review. `goal_done.reviewToken` is accepted as an optional deprecated field and ignored so 0.1-era calls do not fail schema validation; new callers should omit it. Model-facing goal tool-result details are version 2. The display-safe status DTO remains version 1 because its shape is unchanged; `review` is advisory, so `phase: "completed"` may now coexist with `review: "fail"`.
 
 Example foreground call shape:
 
@@ -115,7 +124,7 @@ The provider publishes a versioned, session-scoped, process-local protocol:
 - request: `@neumie/pi-subagents-goal:v1:status-request` with `{ version: 1, sessionId }`;
 - state: `@neumie/pi-subagents-goal:v1:status` with `{ version, providerId, sequence, sessionId, goal, providerError? }`.
 
-Consumers receive objective, phase, timestamps, work counts, at most 128 recent bounded labels plus an omitted count, enabled limits and aggregate usage, continuation/review state, and a generic bounded reason. The payload deliberately omits session files, lineage and goal IDs, item IDs, acknowledgement/review tokens, internal progress signatures, digests, and child output. Requests are exact-session only, repeated state is monotonic per provider instance, malformed consumers cannot affect coordination, and package load order is handled through replay requests plus session-start publication.
+Consumers receive objective, phase, timestamps, work counts, at most 128 recent bounded labels plus an omitted count, enabled limits and aggregate usage, continuation/review state, and a generic bounded reason. The payload deliberately omits session files, lineage and goal IDs, item IDs, acknowledgement tokens, internal progress signatures, digests, and child output. Requests are exact-session only, repeated state is monotonic per provider instance, malformed consumers cannot affect coordination, and package load order is handled through replay requests plus session-start publication.
 
 ## Persistence and recovery
 

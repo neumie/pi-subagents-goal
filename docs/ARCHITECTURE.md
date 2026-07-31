@@ -2,7 +2,7 @@
 
 ## Design objective
 
-`pi-subagents-goal` must continue an autonomous goal only after every owned child is terminal and its output can be surfaced exactly once for consideration. It must never treat silence, process exit, an uncorrelated event, or reviewer prose as completion.
+`pi-subagents-goal` runs an autonomous parent loop that may work entirely through ordinary Pi tools. When the parent explicitly opts into goal-owned child work, the loop continues only after every owned child is terminal and its output can be surfaced exactly once for consideration. It never treats silence, process exit, or an uncorrelated event as completion evidence for that optional owned work.
 
 The implementation is intentionally split into three deep modules and one thin Pi adapter.
 
@@ -19,7 +19,7 @@ A pure, serializable state machine owns all safety invariants:
 - unsuccessful-outcome resolutions;
 - continuation reservation/commit state;
 - enabled budget use and optional token/time limits;
-- independent review evidence;
+- optional advisory review evidence;
 - runtime validation of restored snapshots.
 
 The machine performs no I/O. Every method accepts an explicit timestamp, and tests use deterministic identities and clocks.
@@ -39,7 +39,7 @@ It does not inspect `.pi-subagents` artifacts or poll ambient process state. The
 
 ### `GoalSubagentRunner` — `src/foreground-runner.ts`
 
-The runner translates supported single, parallel, chain, and review calls into ledger admissions plus delegation V2 requests.
+The runner translates optional single, parallel, chain, and review calls into ledger admissions plus delegation V2 requests. The core parent loop does not probe or invoke the provider unless a goal-owned subagent tool is called.
 
 Important ordering:
 
@@ -59,14 +59,15 @@ Parallel concurrency is bounded at four. Chains replace `{previous}` with the pr
 The adapter owns side effects:
 
 - one `/goal` command;
-- five `goal_*` tools;
-- direct-`subagent` blocking while goal authority is live;
+- five optional `goal_*` coordination tools;
+- lazy `pi-subagents` compatibility probing only when `goal_subagent` or `goal_review` is called;
 - session-native persistence;
 - lifecycle guards and recovery;
 - namespace verification after Pi binds runtime actions;
 - continuation `sendMessage()` calls;
-- branch-local review freshness checks;
 - a versioned, session-scoped, display-safe status API.
+
+It does not intercept ordinary tools, including `subagent` when another extension provides it. Those calls remain outside the goal-owned ledger and its completion guarantees.
 
 The adapter performs no direct UI writes. `pi-sidebar` and `pi-footer` own optional presentation by consuming status events. No other goal extension is required or supported.
 
@@ -141,7 +142,9 @@ eligible -> reserved -> queued -> running -> settled
 
 New work invalidates a `reserved` ticket. New work after `queued` is a fault. `commitContinuation()` compares the nonce and expected work generation before changing the ledger to `queued`.
 
-The adapter persists `queued` before calling Pi `sendMessage(..., { triggerTurn: true })`. A synchronous send failure faults the goal and is never retried. On restore, any persisted `reserved`, `queued`, or `running` continuation is ambiguous and faults. This prevents duplicate recovery sends at the cost of stopping after an unprovable crash window.
+The adapter persists `queued` before calling Pi `sendMessage(..., { triggerTurn: true })`. Each queued message begins with its random continuation nonce. `before_agent_start` arms lifecycle handling only from that exact initiating prompt, and `GoalMachine.agentStarted()` independently compares the nonce before `queued -> running`. A foreign turn—such as an installed ordinary subagent's detached completion—cannot consume the ticket, is excluded from goal budget/settlement accounting while the ticket waits, and does not receive the goal system-prompt addition. The exact queued goal turn remains available to run afterward.
+
+A synchronous send failure faults the goal and is never retried. On restore, any persisted `reserved`, `queued`, or `running` continuation is ambiguous and faults. This prevents duplicate recovery sends at the cost of stopping after an unprovable crash window.
 
 Duplicate `agent_start` is idempotent and cannot clear automatic-run accounting. A running continuation accepts `agent_end` only when that event's initiating prompt carries the exact continuation nonce; a stale mismatched end faults the goal. Later low-level retry ends are ignored after the run is armed. `agent_settled` is ignored until a nonce-correlated end has been observed, preventing a stale end/settlement pair from consuming a newly running continuation.
 
@@ -154,9 +157,11 @@ parent settled -> child terminal -> reserve once
 
 The runner caches terminal output before its state-change callback, so the second order can build an output-bearing continuation without artifact polling. Every complete model-facing aggregate—including objective, labels, framing, previews, markers, and tokens—is capped at 48,000 UTF-8 bytes. Truncation walks Unicode code points, and acknowledgement tokens are appended separately and never truncated.
 
-## Completion review
+## Completion and optional review
 
-`goal_review` is itself a ledger item with role `review`. It is admitted only after all existing work is terminal, consumed, and resolved. The child must return a schema-valid object:
+A goal with no goal-owned work can complete directly with `goal_done` and an empty `consideredItemIds` list. If `goal_subagent` or `goal_review` was used, completion still requires every admitted item to be terminal, surfaced, consumed, explicitly resolved when unsuccessful, and included exactly once in `consideredItemIds`.
+
+`goal_review` is optional advisory evidence. It is itself a ledger item with role `review` and is admitted only after existing goal-owned work is terminal, consumed, and resolved. The child must return a schema-valid object:
 
 ```json
 {
@@ -172,15 +177,7 @@ The runner caches terminal output before its state-change callback, so the secon
 }
 ```
 
-Review evidence is bound to:
-
-- the review item;
-- a random review token;
-- current work generation;
-- the exact `goal_review` tool-call ID;
-- a digest of findings.
-
-`goal_done` also scans the active session branch. After the matching review result, only prose-free assistant turns containing `goal_ack_output` or `goal_done`, their tool results, and goal state entries are allowed. Any prose or other tool work makes the review stale. A review acknowledgement and `goal_done` in the same assistant tool batch are rejected because sibling execution order is not completion evidence. The system prompt, tool guidance, and every continuation state this sequencing explicitly and repeat the exact goal ID/epoch.
+The machine binds advisory review evidence to the review item and current work generation and retains only a digest of findings. The review output must be acknowledged because it was explicitly admitted as goal-owned work, but neither a review nor a passing verdict is a prerequisite for `goal_done`. Ordinary work performed after a review does not trigger a special branch scan or invalidate completion.
 
 ## Persistence
 
@@ -218,10 +215,12 @@ Those values remain in normal Pi messages/tool results. Snapshot fields retain o
 
 `src/status-api.ts` publishes `@neumie/pi-subagents-goal:v1:status` and accepts exact-session replay requests on `@neumie/pi-subagents-goal:v1:status-request`. Every envelope carries a provider-instance ID and monotonic sequence so consumers can reject stale updates and survive extension load-order changes.
 
-The display-safe payload includes objective, phase, timestamps, work aggregates, at most 128 recent bounded labels plus an omitted count, optional limits and aggregate usage, continuation/review state, and a generic bounded reason. It omits session files, lineage/goal/item IDs, acknowledgement and review tokens, internal progress signatures, digests, prompts, findings, raw faults, and child output. Emission is isolated from coordination: malformed requests and throwing listeners are ignored. The goal extension never calls Pi status, widget, footer, or notification APIs.
+The display-safe payload includes objective, phase, timestamps, work aggregates, at most 128 recent bounded labels plus an omitted count, optional limits and aggregate usage, continuation/review state, and a generic bounded reason. It omits session files, lineage/goal/item IDs, acknowledgement tokens, internal progress signatures, digests, prompts, findings, raw faults, and child output. Emission is isolated from coordination: malformed requests and throwing listeners are ignored. The goal extension never calls Pi status, widget, footer, or notification APIs.
 
 ## Supported and unsupported coordination
 
-Foreground delegation V2 is supported because the caller owns the request lifetime and receives the terminal response before deciding whether to continue.
+When an ordinary `subagent` tool is installed, its use is allowed and retains its upstream behavior; it is deliberately outside goal ownership, acknowledgement, and completion checks.
 
-Current detached RPC `spawn` is unsupported because `pi-subagents` owns its notification turn. The bridge contains a versioned future client, but the Pi adapter rejects detached requests even if only the provider capability appears: Pi also needs an atomic caller-owned enqueue/acknowledgement primitive. The exact proposal is in [`UPSTREAM-INTEGRATION.md`](UPSTREAM-INTEGRATION.md).
+Optional goal-owned foreground delegation V2 is supported because the caller owns the request lifetime and receives the terminal response before deciding whether to continue.
+
+Current goal-owned detached RPC `spawn` is unsupported because `pi-subagents` owns its notification turn. The bridge contains a versioned future client, but the Pi adapter rejects detached requests even if only the provider capability appears: Pi also needs an atomic caller-owned enqueue/acknowledgement primitive. The exact proposal is in [`UPSTREAM-INTEGRATION.md`](UPSTREAM-INTEGRATION.md).

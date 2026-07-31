@@ -45,6 +45,7 @@ import {
 const MAX_OBJECTIVE_BYTES = 10_000;
 const CONTINUATION_TRUNCATION_MARKER =
 	"\n[Child preview truncated; inspect its child session before acknowledgement if omitted evidence matters.]";
+const CONTINUATION_NONCE_PREFIX = "Goal continuation nonce: ";
 const EXTENSION_ENTRY_PATH = fileURLToPath(new URL("../index.ts", import.meta.url));
 export const GOAL_TOOL_NAMES = [
 	"goal_subagent",
@@ -135,7 +136,13 @@ const GoalDoneSchema = Type.Object(
 		goalId: Type.String({ minLength: 1, maxLength: 256 }),
 		epoch: Type.Integer({ minimum: 1 }),
 		summary: Type.String({ minLength: 1, maxLength: 10_000 }),
-		reviewToken: Type.String({ minLength: 1, maxLength: 256 }),
+		reviewToken: Type.Optional(
+			Type.String({
+				minLength: 1,
+				maxLength: 256,
+				description: "Deprecated compatibility field; accepted but ignored.",
+			}),
+		),
 		consideredItemIds: Type.Array(Type.String({ minLength: 1, maxLength: 256 }), {
 			maxItems: 10_000,
 		}),
@@ -150,13 +157,12 @@ type GoalReviewInput = Static<typeof GoalReviewSchema>;
 type GoalDoneInput = Static<typeof GoalDoneSchema>;
 
 interface GoalToolDetails {
-	version: 1;
+	version: 2;
 	goalId: string;
 	epoch: number;
 	lineageId: string;
 	itemIds: string[];
 	acknowledgements?: Array<{ itemId: string; ackToken: string }>;
-	reviewToken?: string;
 	verdict?: "pass" | "fail";
 }
 
@@ -199,17 +205,12 @@ function outputText(content: unknown): string {
 		.join("\n");
 }
 
-function messageFromEntry(entry: SessionEntryLike): Record<string, unknown> | undefined {
-	if (entry.type === "message" && isRecord(entry.message)) return entry.message;
-	if (entry.type === "custom_message" && typeof entry.customType === "string") {
-		return {
-			role: "custom",
-			customType: entry.customType,
-			content: entry.content,
-			...(entry.details !== undefined ? { details: entry.details } : {}),
-		};
-	}
-	return undefined;
+function continuationNonceFromPrompt(prompt: unknown): string | undefined {
+	if (typeof prompt !== "string") return undefined;
+	const firstLine = prompt.split("\n", 1)[0];
+	if (!firstLine?.startsWith(CONTINUATION_NONCE_PREFIX)) return undefined;
+	const nonce = firstLine.slice(CONTINUATION_NONCE_PREFIX.length).trim();
+	return nonce && nonce.length <= 256 ? nonce : undefined;
 }
 
 function agentEndContainsContinuation(messages: unknown[], expectedNonce: string): boolean {
@@ -222,72 +223,6 @@ function agentEndContainsContinuation(messages: unknown[], expectedNonce: string
 			return false;
 		return rawMessage.details.ticket.nonce === expectedNonce;
 	});
-}
-
-function toolCalls(message: Record<string, unknown>): Array<{ id?: string; name: string }> {
-	if (message.role !== "assistant" || !Array.isArray(message.content)) return [];
-	return message.content.flatMap((block) => {
-		if (!isRecord(block) || block.type !== "toolCall" || typeof block.name !== "string") return [];
-		const call: { id?: string; name: string } = { name: block.name };
-		if (typeof block.id === "string") call.id = block.id;
-		return [call];
-	});
-}
-
-function isAllowedAfterReview(message: Record<string, unknown>): boolean {
-	const allowed = new Set(["goal_ack_output", "goal_done"]);
-	if (message.role === "toolResult") {
-		return typeof message.toolName === "string" && allowed.has(message.toolName);
-	}
-	if (message.role === "custom") return message.customType === GOAL_CONTINUATION_MESSAGE;
-	if (message.role !== "assistant" || !Array.isArray(message.content) || message.content.length === 0)
-		return false;
-	let allowedCalls = 0;
-	const onlyCompletionContent = message.content.every((block) => {
-		if (!isRecord(block)) return false;
-		if (block.type === "thinking") return true;
-		if (block.type !== "toolCall" || typeof block.name !== "string" || !allowed.has(block.name)) return false;
-		allowedCalls += 1;
-		return true;
-	});
-	return onlyCompletionContent && allowedCalls > 0;
-}
-
-function isAllowedEntryAfterReview(entry: SessionEntryLike): boolean {
-	if (entry.type === "custom" && entry.customType === GOAL_STATE_ENTRY) return true;
-	const message = messageFromEntry(entry);
-	return Boolean(message && isAllowedAfterReview(message));
-}
-
-function reviewIsCurrent(ctx: ExtensionContext, reviewToken: string, reviewToolCallId: string): boolean {
-	const branch = ctx.sessionManager.getBranch() as SessionEntryLike[];
-	let reviewResultIndex = -1;
-	for (let index = branch.length - 1; index >= 0; index -= 1) {
-		const message = messageFromEntry(branch[index] ?? {});
-		if (message?.role !== "toolResult" || message.toolName !== "goal_review") continue;
-		if (message.toolCallId !== reviewToolCallId || !isRecord(message.details)) continue;
-		if (message.details.reviewToken === reviewToken) {
-			reviewResultIndex = index;
-			break;
-		}
-	}
-	if (reviewResultIndex < 0) return false;
-	for (const entry of branch.slice(reviewResultIndex + 1)) {
-		if (!isAllowedEntryAfterReview(entry)) return false;
-	}
-	return true;
-}
-
-function currentAssistantHasAckSibling(ctx: ExtensionContext, currentToolCallId: string): boolean {
-	const branch = ctx.sessionManager.getBranch() as SessionEntryLike[];
-	for (let index = branch.length - 1; index >= 0; index -= 1) {
-		const message = messageFromEntry(branch[index] ?? {});
-		if (message?.role !== "assistant") continue;
-		const calls = toolCalls(message);
-		if (!calls.some((call) => call.id === currentToolCallId)) continue;
-		return calls.some((call) => call.id !== currentToolCallId && call.name === "goal_ack_output");
-	}
-	return true;
 }
 
 function turnOutputTokens(event: TurnEndEvent): number {
@@ -321,17 +256,16 @@ function assertGoalIdentity(machine: GoalMachine, goalId: string, epoch: number)
 
 function extensionSystemPrompt(objective: string, snapshot: GoalSnapshot): string {
 	return [
-		"PI SUBAGENTS GOAL MODE IS ACTIVE.",
+		"PI GOAL MODE IS ACTIVE.",
 		`Goal ID: ${snapshot.owner.goalId}`,
 		`Goal epoch: ${snapshot.owner.epoch}`,
 		`Objective: ${objective}`,
+		"Work directly with ordinary tools whenever useful. Both pi-subagents and its goal-owned tools are optional.",
+		"When an ordinary subagent tool is installed, its calls remain available but are outside the goal-owned ledger. Use goal_subagent only when exact child ownership and output acknowledgement are useful.",
 		"Use the exact goal ID and epoch above in every goal_* call; never search environment variables, session artifacts, or process state for them.",
-		"Use goal_subagent—not subagent—for all delegated work. Direct subagent calls are blocked because they cannot carry exact goal ownership.",
-		"After each child result, consider it and call goal_ack_output with its exact acknowledgement token. Explicitly resolve unsuccessful child outcomes with goal_resolve.",
-		"Before completion, call goal_review for a fresh independent structured review and address every blocker.",
-		"After a passing review, acknowledge its output in a later tool-only assistant turn: thinking plus goal_ack_output, with no prose or other tool call.",
-		"Then call goal_done in a later tool-only assistant turn: thinking plus goal_done, with no prose or other tool call. Treat both as trivial protocol turns and suppress normal progress narration; any other post-review content invalidates the review.",
-		"Call goal_done only with every exact considered item ID and the current passing review token. Prose never completes the goal.",
+		"If goal_subagent or goal_review is used, consider and acknowledge every surfaced output, and explicitly resolve unsuccessful owned outcomes with goal_resolve.",
+		"goal_review is optional advisory evidence, not a completion prerequisite.",
+		"Call goal_done with every exact considered goal-owned item ID; use an empty list when no goal-owned work was launched. No review token is required. Prose never completes the goal.",
 		"Automatic-turn and no-progress budgets are enabled by default; token and wall-clock limits are optional.",
 	].join("\n");
 }
@@ -349,6 +283,8 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	let statusSequence = 0;
 	let latestStatus: GoalStatusEnvelope | undefined;
 	let runtimeEpoch = 0;
+	let pendingContinuationNonce: string | undefined;
+	let currentRunTracked = false;
 
 	const assertNamespace = () => {
 		if (namespaceFault) throw new GoalInvariantError(namespaceFault);
@@ -442,6 +378,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		}
 		const render = (previews: string[]) =>
 			[
+				`${CONTINUATION_NONCE_PREFIX}${ticket.nonce}`,
 				`Continue working autonomously toward: ${objective}`,
 				"",
 				"Exact identity for every goal_* call (do not search for it elsewhere):",
@@ -451,8 +388,8 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 				...(acknowledgementLines.length > 0
 					? ["", "Acknowledgement tokens (never truncated):", ...acknowledgementLines]
 					: []),
-				"Use goal_ack_output after considering newly surfaced output. Do not call goal_done until all runtime gates and independent review pass.",
-				"After a passing review, use a prose-free goal_ack_output-only turn, then a separate prose-free goal_done-only turn. These are trivial protocol turns: suppress normal progress narration because any other post-review content invalidates that review.",
+				"Use goal_ack_output after considering every newly surfaced goal-owned output. Resolve unsuccessful owned work explicitly before completion.",
+				"goal_review remains optional. Call goal_done once all goal-owned items are consumed, resolved where needed, and included in consideredItemIds.",
 			].join("\n");
 		const previewLimit =
 			outputs.length > 0
@@ -521,6 +458,8 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	const restore = (event: SessionStartEvent, ctx: ExtensionContext) => {
 		currentCtx = ctx;
 		runtimeEpoch += 1;
+		pendingContinuationNonce = undefined;
+		currentRunTracked = false;
 		outputCache.clear();
 		compatibility = undefined;
 		compatibilitySessionId = undefined;
@@ -577,13 +516,10 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			}
 		}
 		publishStatus(ctx);
-		void ensureCompatibility(ctx).catch(() => {
-			// Foreground tools report the actionable compatibility error when called.
-		});
 	};
 
 	pi.registerCommand("goal", {
-		description: "Start or control the native pi-subagents-aware goal loop",
+		description: "Start or control an autonomous goal loop with optional pi-subagents coordination",
 		handler: async (args, ctx) => {
 			assertNamespace();
 			const trimmed = args.trim();
@@ -639,13 +575,14 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 					{
 						customType: GOAL_CONTINUATION_MESSAGE,
 						content: [
+							`${CONTINUATION_NONCE_PREFIX}${initial.nonce}`,
 							`Begin working autonomously toward: ${goalObjective}`,
 							"",
 							"Exact identity for every goal_* call (do not search for it elsewhere):",
 							`- goalId: ${snapshot.owner.goalId}`,
 							`- epoch: ${snapshot.owner.epoch}`,
-							"Use goal_subagent for delegated work, acknowledge every surfaced output, resolve unsuccessful work, and obtain a passing goal_review before completion.",
-							"After a passing review, use a prose-free goal_ack_output-only turn, then a separate prose-free goal_done-only turn. These are trivial protocol turns: suppress normal progress narration because any other post-review content invalidates that review.",
+							"Work directly with ordinary tools. pi-subagents, goal_subagent, and goal_review are optional.",
+							"If goal-owned work is used, acknowledge every surfaced output and resolve unsuccessful outcomes before goal_done. An empty consideredItemIds list is valid when no goal-owned work was launched.",
 						].join("\n"),
 						display: true,
 						details: { version: 1, owner: snapshot.owner, ticket: initial },
@@ -673,7 +610,8 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		promptSnippet:
 			"Launch goal-owned foreground pi-subagents work with exact ownership and output acknowledgement",
 		promptGuidelines: [
-			"Use goal_subagent instead of subagent whenever /goal is active.",
+			"goal_subagent is optional; use it only when exact goal ownership and acknowledgement are useful.",
+			"When installed, ordinary subagent remains available but is not tracked by the goal-owned ledger.",
 			"After goal_subagent returns, consider every child output and call goal_ack_output with every exact acknowledgement token.",
 		],
 		parameters: GoalSubagentSchema,
@@ -733,7 +671,10 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			publishStatus(ctx);
 			return {
 				content: [{ type: "text", text: `Acknowledged ${params.items.length} goal-owned output item(s).` }],
-				details: { version: 1, itemIds: params.items.map((item) => item.itemId) },
+				details: {
+					version: GOAL_TOOL_DETAILS_VERSION,
+					itemIds: params.items.map((item) => item.itemId),
+				},
 			};
 		},
 	});
@@ -768,7 +709,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 						text: `Recorded explicit resolution for ${params.itemId}; its unsuccessful outcome remains in the ledger.`,
 					},
 				],
-				details: { version: 1, itemId: params.itemId },
+				details: { version: GOAL_TOOL_DETAILS_VERSION, itemId: params.itemId },
 			};
 		},
 	});
@@ -777,13 +718,14 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		name: "goal_review",
 		label: "Goal Review",
 		description:
-			"Run a fresh, structured, independent pi-subagents review bound to the current work generation.",
+			"Optionally run a structured, independent pi-subagents review bound to the current work generation.",
 		promptGuidelines: [
-			"Use goal_review only after all prior child outputs are acknowledged and all unsuccessful work is explicitly resolved.",
-			"After a passing review, do no further work. In a later assistant turn, acknowledge its output with only thinking and goal_ack_output—no prose or other tool calls. This is a trivial protocol turn; suppress normal progress narration.",
+			"goal_review is optional advisory evidence, not a prerequisite for goal_done.",
+			"Use it only after prior goal-owned output is acknowledged and unsuccessful owned work is explicitly resolved.",
+			"Its output is goal-owned and must be acknowledged before completion.",
 		],
 		parameters: GoalReviewSchema,
-		async execute(toolCallId, params: GoalReviewInput, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params: GoalReviewInput, signal, _onUpdate, ctx) {
 			const active = requireMachine(ctx);
 			assertGoalIdentity(active, params.goalId, params.epoch);
 			await ensureCompatibility(ctx);
@@ -793,7 +735,6 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 					params.focus ??
 					"Correctness, deterministic races, Pi compatibility, test adequacy, and unresolved blockers.",
 				objective,
-				toolCallId,
 				signal,
 				cwd: ctx.cwd,
 				...(params.agent !== undefined ? { agent: params.agent } : {}),
@@ -808,7 +749,6 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 				lineageId: owner.lineageId,
 				itemIds: [review.itemId],
 				acknowledgements: [{ itemId: review.itemId, ackToken: review.ackToken }],
-				reviewToken: review.reviewToken,
 				verdict: review.verdict,
 			};
 			return {
@@ -820,7 +760,6 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 							findings,
 							`Review item: ${review.itemId}`,
 							`Acknowledgement token: ${review.ackToken}`,
-							`Review token for goal_done after acknowledgement: ${review.reviewToken}`,
 						].join("\n\n"),
 					},
 				],
@@ -833,24 +772,18 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		name: "goal_done",
 		label: "Goal Done",
 		description:
-			"Complete the active goal only when every owned child is terminal, every output is acknowledged, failures are explicitly resolved, enabled budgets remain, and a current independent review passed.",
+			"Complete the active goal when enabled budgets remain and every goal-owned item, if any, is terminal, consumed, resolved where needed, and considered. Subagents and review are optional.",
 		promptGuidelines: [
-			"Call goal_done only after goal_review passes and its output has been acknowledged in an earlier tool batch.",
-			"The review-acknowledgement turn and goal_done turn must contain only thinking plus their single goal tool call. Treat both as trivial protocol turns and suppress normal progress narration; prose or any other post-review work invalidates the review.",
+			"No subagent or independent review is required for goal_done.",
+			"Include every goal-owned item ID returned by goal_subagent or goal_review; use an empty list if neither was used.",
 		],
 		parameters: GoalDoneSchema,
-		async execute(toolCallId, params: GoalDoneInput, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params: GoalDoneInput, _signal, _onUpdate, ctx) {
 			const active = requireMachine(ctx);
 			assertGoalIdentity(active, params.goalId, params.epoch);
-			const review = active.snapshot.review;
 			const request: CompletionRequest = {
 				owner: active.snapshot.owner,
-				reviewToken: params.reviewToken,
 				consideredItemIds: params.consideredItemIds,
-				reviewIsCurrent:
-					Boolean(review) &&
-					!currentAssistantHasAckSibling(ctx, toolCallId) &&
-					reviewIsCurrent(ctx, params.reviewToken, review?.toolCallId ?? ""),
 				now: Date.now(),
 			};
 			const decision = active.complete(request);
@@ -859,19 +792,15 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			publishStatus(ctx);
 			return {
 				content: [{ type: "text", text: `Goal complete.\n\n${params.summary}` }],
-				details: { version: 1, goalId: params.goalId, epoch: params.epoch, status: "completed" },
+				details: {
+					version: GOAL_TOOL_DETAILS_VERSION,
+					goalId: params.goalId,
+					epoch: params.epoch,
+					status: "completed",
+				},
 				terminate: true,
 			};
 		},
-	});
-
-	pi.on("tool_call", (event) => {
-		if (event.toolName !== "subagent" || !machine || !isLivePhase(machine.snapshot.phase)) return;
-		return {
-			block: true,
-			reason:
-				"Direct subagent calls are blocked during /goal because the current pi-subagents contract cannot atomically bind them to this session/lineage/goal/epoch. Use goal_subagent foreground mode.",
-		};
 	});
 
 	pi.on("tool_result", (event, ctx) => {
@@ -900,19 +829,35 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => {
+		pendingContinuationNonce = continuationNonceFromPrompt(event.prompt);
 		if (!machine || !objective || machine.snapshot.phase !== "active") return;
+		const continuation = machine.snapshot.continuation;
+		if (continuation?.status === "queued" && pendingContinuationNonce !== continuation.ticket.nonce) {
+			return;
+		}
 		return { systemPrompt: `${event.systemPrompt}\n\n${extensionSystemPrompt(objective, machine.snapshot)}` };
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
-		if (!machine) return;
-		machine.agentStarted(Date.now());
+		if (!machine) {
+			pendingContinuationNonce = undefined;
+			currentRunTracked = false;
+			return;
+		}
+		const before = machine.snapshot;
+		const preserveTrackedRun =
+			currentRunTracked &&
+			(before.continuation?.status === "running" || (!before.continuation && !before.parentSettled));
+		const started = machine.agentStarted(Date.now(), pendingContinuationNonce);
+		pendingContinuationNonce = undefined;
+		currentRunTracked = started || preserveTrackedRun;
+		if (!started) return;
 		persist();
 		publishStatus(ctx);
 	});
 
 	pi.on("agent_end", (event, ctx) => {
-		if (!machine) return;
+		if (!machine || !currentRunTracked) return;
 		const snapshot = machine.snapshot;
 		if (snapshot.currentRunEndObserved) return;
 		const continuation = snapshot.continuation;
@@ -935,7 +880,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	});
 
 	pi.on("turn_end", (event, ctx) => {
-		if (!machine) return;
+		if (!machine || !currentRunTracked) return;
 		machine.recordTurn({
 			tokens: turnOutputTokens(event),
 			progressSignature: turnProgressSignature(event),
@@ -946,8 +891,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
-		if (!machine) return;
+		if (!machine || !currentRunTracked) return;
 		const ticket = machine.agentSettled(Date.now());
+		currentRunTracked = false;
 		persist();
 		publishStatus(ctx);
 		if (ticket) dispatchContinuation(ctx, ticket);
@@ -994,6 +940,8 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			bridge = new SubagentBridge(pi.events);
 			compatibility = undefined;
 			compatibilitySessionId = undefined;
+			pendingContinuationNonce = undefined;
+			currentRunTracked = false;
 			currentCtx = undefined;
 			latestStatus = undefined;
 		}

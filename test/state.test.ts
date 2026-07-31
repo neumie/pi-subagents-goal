@@ -79,7 +79,7 @@ function surfaceAndAck(target: GoalMachine, itemId: string, ackToken: string, ti
 	);
 }
 
-function successfulReviewedMachine() {
+function reviewedMachine(verdict: "pass" | "fail" = "pass") {
 	const target = machine();
 	admit(target, "work-1");
 	target.startWork(owner(), "work-1", NOW + 2);
@@ -95,22 +95,19 @@ function successfulReviewedMachine() {
 	});
 	target.startWork(owner(), "review-1", NOW + 7);
 	const reviewAck = finish(target, "review-1", "succeeded", NOW + 8);
-	const reviewToken = newAckToken();
 	assert.equal(
 		target.recordReview({
 			owner: owner(),
 			itemId: "review-1",
-			reviewToken,
-			verdict: "pass",
+			verdict,
 			workGeneration,
-			toolCallId: "tool-review-1",
 			findings: "No blockers",
 			now: NOW + 9,
 		}),
 		true,
 	);
 	surfaceAndAck(target, "review-1", reviewAck, NOW + 10);
-	return { target, reviewToken };
+	return target;
 }
 
 describe("continuation barrier", () => {
@@ -193,20 +190,30 @@ describe("continuation barrier", () => {
 	it("ignores duplicate starts and settlements until the current run has ended", () => {
 		const target = machine();
 		const initial = target.queueInitialContinuation(NOW + 1);
-		assert.equal(target.agentStarted(NOW + 2), true);
-		assert.equal(target.agentStarted(NOW + 2), false);
+		assert.equal(target.agentStarted(NOW + 2, initial.nonce), true);
+		assert.equal(target.agentStarted(NOW + 2, initial.nonce), false);
 		settleParent(target, NOW + 3);
 		const automatic = target.snapshot.continuation?.ticket;
 		assert.ok(automatic);
 		assert.equal(target.commitContinuation(automatic, NOW + 4), true);
-		assert.equal(target.agentStarted(NOW + 5), true);
+		assert.equal(target.agentStarted(NOW + 5, automatic.nonce), true);
 		assert.equal(target.snapshot.currentRunAutomatic, true);
-		assert.equal(target.agentStarted(NOW + 5), false);
+		assert.equal(target.agentStarted(NOW + 5, automatic.nonce), false);
 		assert.equal(target.snapshot.currentRunAutomatic, true);
 		assert.equal(target.agentEnded(NOW + 6, initial.nonce), false);
 		assert.equal(target.agentSettled(NOW + 6), undefined);
 		assert.equal(target.snapshot.continuation?.status, "running");
 		assert.equal(target.snapshot.continuation?.ticket.sequence, automatic.sequence);
+	});
+
+	it("does not let an unrelated parent run consume a queued continuation", () => {
+		const target = machine();
+		const initial = target.queueInitialContinuation(NOW + 1);
+		assert.equal(target.agentStarted(NOW + 2), false);
+		assert.equal(target.agentStarted(NOW + 3, "wrong"), false);
+		assert.equal(target.snapshot.continuation?.status, "queued");
+		assert.equal(target.agentStarted(NOW + 4, initial.nonce), true);
+		assert.equal(target.snapshot.continuation?.status, "running");
 	});
 
 	it("rejects reused item IDs even when the attempt differs", () => {
@@ -253,9 +260,7 @@ describe("work outcomes and output acknowledgement", () => {
 			surfaceAndAck(target, "run", ackToken);
 			const decision = target.completionDecision({
 				owner: owner(),
-				reviewToken: "missing",
 				consideredItemIds: ["run"],
-				reviewIsCurrent: false,
 				now: NOW + 6,
 			});
 			assert.equal(decision.ok, false);
@@ -386,13 +391,13 @@ describe("finite budgets", () => {
 
 	it("exhausts the automatic turn budget exactly at the limit", () => {
 		const target = machine({ maxAutomaticTurns: 2, maxNoProgressTurns: 10 });
-		target.queueInitialContinuation(NOW + 1);
-		target.agentStarted(NOW + 2);
+		const initial = target.queueInitialContinuation(NOW + 1);
+		target.agentStarted(NOW + 2, initial.nonce);
 		settleParent(target, NOW + 3);
 		const ticket = target.snapshot.continuation?.ticket;
 		assert.ok(ticket);
 		target.commitContinuation(ticket, NOW + 4);
-		target.agentStarted(NOW + 5);
+		target.agentStarted(NOW + 5, ticket.nonce);
 		target.recordTurn({ tokens: 1, progressSignature: "one", now: NOW + 6 });
 		target.recordTurn({ tokens: 1, progressSignature: "two", now: NOW + 7 });
 		assert.equal(target.snapshot.phase, "budget_exhausted");
@@ -401,21 +406,21 @@ describe("finite budgets", () => {
 
 	it("enforces token, wall-clock, and no-progress limits", () => {
 		const initialTokenTarget = machine({ maxTokens: 5, maxNoProgressTurns: 10 });
-		initialTokenTarget.queueInitialContinuation(NOW + 1);
-		initialTokenTarget.agentStarted(NOW + 2);
+		const initialTokenTicket = initialTokenTarget.queueInitialContinuation(NOW + 1);
+		initialTokenTarget.agentStarted(NOW + 2, initialTokenTicket.nonce);
 		initialTokenTarget.recordTurn({ tokens: 5, progressSignature: "initial", now: NOW + 3 });
 		assert.equal(initialTokenTarget.snapshot.budgetUsage.tokens, 5);
 		assert.equal(initialTokenTarget.snapshot.budgetUsage.automaticTurns, 0);
 		assert.equal(initialTokenTarget.snapshot.phase, "budget_exhausted");
 
 		const tokenTarget = machine({ maxTokens: 5, maxNoProgressTurns: 10 });
-		tokenTarget.queueInitialContinuation(NOW + 1);
-		tokenTarget.agentStarted(NOW + 2);
+		const initialTokenRun = tokenTarget.queueInitialContinuation(NOW + 1);
+		tokenTarget.agentStarted(NOW + 2, initialTokenRun.nonce);
 		settleParent(tokenTarget, NOW + 3);
 		const tokenTicket = tokenTarget.snapshot.continuation?.ticket;
 		assert.ok(tokenTicket);
 		tokenTarget.commitContinuation(tokenTicket, NOW + 4);
-		tokenTarget.agentStarted(NOW + 5);
+		tokenTarget.agentStarted(NOW + 5, tokenTicket.nonce);
 		tokenTarget.recordTurn({ tokens: 5, progressSignature: "token", now: NOW + 6 });
 		assert.equal(tokenTarget.snapshot.phase, "budget_exhausted");
 
@@ -448,13 +453,13 @@ describe("finite budgets", () => {
 		assert.equal(pausedTarget.snapshot.phase, "budget_exhausted");
 
 		const noProgressTarget = machine({ maxNoProgressTurns: 2, maxAutomaticTurns: 10 });
-		noProgressTarget.queueInitialContinuation(NOW + 1);
-		noProgressTarget.agentStarted(NOW + 2);
+		const initialNoProgressRun = noProgressTarget.queueInitialContinuation(NOW + 1);
+		noProgressTarget.agentStarted(NOW + 2, initialNoProgressRun.nonce);
 		settleParent(noProgressTarget, NOW + 3);
 		const noProgressTicket = noProgressTarget.snapshot.continuation?.ticket;
 		assert.ok(noProgressTicket);
 		noProgressTarget.commitContinuation(noProgressTicket, NOW + 4);
-		noProgressTarget.agentStarted(NOW + 5);
+		noProgressTarget.agentStarted(NOW + 5, noProgressTicket.nonce);
 		noProgressTarget.recordTurn({ tokens: 1, progressSignature: "same", now: NOW + 6 });
 		noProgressTarget.recordTurn({ tokens: 1, progressSignature: "same", now: NOW + 7 });
 		noProgressTarget.recordTurn({ tokens: 1, progressSignature: "same", now: NOW + 8 });
@@ -462,64 +467,57 @@ describe("finite budgets", () => {
 	});
 });
 
-describe("review and goal completion", () => {
-	it("denies goal_done while work is active or output is unread", () => {
+describe("optional goal-owned work and completion", () => {
+	it("denies goal_done while goal-owned work is active or output is unread", () => {
 		const target = machine();
 		admit(target, "run");
 		let decision = target.completionDecision({
 			owner: owner(),
-			reviewToken: "none",
 			consideredItemIds: [],
-			reviewIsCurrent: false,
 			now: NOW + 2,
 		});
 		assert.match(decision.blockers.join("\n"), /nonterminal work/);
 		finish(target, "run");
 		decision = target.completionDecision({
 			owner: owner(),
-			reviewToken: "none",
 			consideredItemIds: ["run"],
-			reviewIsCurrent: false,
 			now: NOW + 4,
 		});
 		assert.match(decision.blockers.join("\n"), /unconsumed output/);
 	});
 
-	it("completes only with current passing independent review and all considered work", () => {
-		const { target, reviewToken } = successfulReviewedMachine();
+	it("completes without pi-subagents work or independent review", () => {
+		const target = machine();
+		const decision = target.complete({ owner: owner(), consideredItemIds: [], now: NOW + 1 });
+		assert.deepEqual(decision, { ok: true, blockers: [] });
+		assert.equal(target.snapshot.phase, "completed");
+	});
+
+	it("treats an invoked review as advisory after its owned output is consumed", () => {
+		const target = reviewedMachine("fail");
 		const decision = target.complete({
 			owner: owner(),
-			reviewToken,
 			consideredItemIds: ["work-1", "review-1"],
-			reviewIsCurrent: true,
 			now: NOW + 12,
 		});
 		assert.deepEqual(decision, { ok: true, blockers: [] });
 		assert.equal(target.snapshot.phase, "completed");
 	});
 
-	it("rejects stale, failed, or mismatched review evidence", () => {
-		const { target, reviewToken } = successfulReviewedMachine();
-		admit(target, "new-work");
-		const stale = target.completionDecision({
-			owner: owner(),
-			reviewToken,
-			consideredItemIds: ["work-1", "review-1", "new-work"],
-			reviewIsCurrent: true,
-			now: NOW + 13,
-		});
-		assert.match(stale.blockers.join("\n"), /review evidence is missing|nonterminal work/);
-
-		const { target: mismatched, reviewToken: correctToken } = successfulReviewedMachine();
-		const wrong = mismatched.completionDecision({
-			owner: owner(),
-			reviewToken: `${correctToken}x`,
-			consideredItemIds: ["work-1", "review-1"],
-			reviewIsCurrent: false,
-			now: NOW + 13,
-		});
-		assert.match(wrong.blockers.join("\n"), /review token does not match/);
-		assert.match(wrong.blockers.join("\n"), /work occurred after independent review/);
+	it("still rejects omitted, unknown, or repeated goal-owned item IDs", () => {
+		const target = reviewedMachine();
+		for (const consideredItemIds of [
+			["work-1"],
+			["work-1", "review-1", "unknown"],
+			["work-1", "review-1", "review-1"],
+		]) {
+			const decision = target.completionDecision({
+				owner: owner(),
+				consideredItemIds,
+				now: NOW + 13,
+			});
+			assert.equal(decision.ok, false);
+		}
 	});
 
 	it("requires unsuccessful work to be acknowledged and explicitly resolved before review", () => {
@@ -545,7 +543,7 @@ describe("ordinary goals", () => {
 		const target = machine();
 		const initial = target.queueInitialContinuation(NOW + 1);
 		assert.equal(initial.kind, "initial");
-		target.agentStarted(NOW + 2);
+		target.agentStarted(NOW + 2, initial.nonce);
 		const continuation = settleParent(target, NOW + 3);
 		assert.ok(continuation);
 		assert.equal(continuation.kind, "automatic");

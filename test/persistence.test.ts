@@ -190,10 +190,8 @@ describe("session-native goal persistence", () => {
 				mutate: (state) => {
 					state.review = {
 						itemId: "missing-review",
-						reviewToken: "review-token",
 						verdict: "pass",
 						workGeneration: state.workGeneration,
-						toolCallId: "review-call",
 						findingsDigest: sha256("none"),
 					};
 				},
