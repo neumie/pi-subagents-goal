@@ -180,7 +180,7 @@ Review evidence is bound to:
 - the exact `goal_review` tool-call ID;
 - a digest of findings.
 
-`goal_done` also scans the active session branch. After the matching review result, only `goal_ack_output` and `goal_done` calls/results are allowed. Any other tool work makes the review stale. A review acknowledgement and `goal_done` in the same assistant tool batch are rejected because sibling execution order is not completion evidence.
+`goal_done` also scans the active session branch. After the matching review result, only prose-free assistant turns containing `goal_ack_output` or `goal_done`, their tool results, and goal state entries are allowed. Any prose or other tool work makes the review stale. A review acknowledgement and `goal_done` in the same assistant tool batch are rejected because sibling execution order is not completion evidence. The system prompt, tool guidance, and every continuation state this sequencing explicitly and repeat the exact goal ID/epoch.
 
 ## Persistence
 

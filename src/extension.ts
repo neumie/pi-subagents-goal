@@ -325,9 +325,12 @@ function extensionSystemPrompt(objective: string, snapshot: GoalSnapshot): strin
 		`Goal ID: ${snapshot.owner.goalId}`,
 		`Goal epoch: ${snapshot.owner.epoch}`,
 		`Objective: ${objective}`,
+		"Use the exact goal ID and epoch above in every goal_* call; never search environment variables, session artifacts, or process state for them.",
 		"Use goal_subagent—not subagent—for all delegated work. Direct subagent calls are blocked because they cannot carry exact goal ownership.",
 		"After each child result, consider it and call goal_ack_output with its exact acknowledgement token. Explicitly resolve unsuccessful child outcomes with goal_resolve.",
-		"Before completion, call goal_review for a fresh independent structured review, acknowledge that review output, and address every blocker.",
+		"Before completion, call goal_review for a fresh independent structured review and address every blocker.",
+		"After a passing review, acknowledge its output in a later tool-only assistant turn: thinking plus goal_ack_output, with no prose or other tool call.",
+		"Then call goal_done in a later tool-only assistant turn: thinking plus goal_done, with no prose or other tool call. Treat both as trivial protocol turns and suppress normal progress narration; any other post-review content invalidates the review.",
 		"Call goal_done only with every exact considered item ID and the current passing review token. Prose never completes the goal.",
 		"Automatic-turn and no-progress budgets are enabled by default; token and wall-clock limits are optional.",
 	].join("\n");
@@ -440,11 +443,16 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		const render = (previews: string[]) =>
 			[
 				`Continue working autonomously toward: ${objective}`,
+				"",
+				"Exact identity for every goal_* call (do not search for it elsewhere):",
+				`- goalId: ${snapshot.owner.goalId}`,
+				`- epoch: ${snapshot.owner.epoch}`,
 				...outputs.flatMap((output, index) => ["", output.header, previews[index] ?? ""]),
 				...(acknowledgementLines.length > 0
 					? ["", "Acknowledgement tokens (never truncated):", ...acknowledgementLines]
 					: []),
 				"Use goal_ack_output after considering newly surfaced output. Do not call goal_done until all runtime gates and independent review pass.",
+				"After a passing review, use a prose-free goal_ack_output-only turn, then a separate prose-free goal_done-only turn. These are trivial protocol turns: suppress normal progress narration because any other post-review content invalidates that review.",
 			].join("\n");
 		const previewLimit =
 			outputs.length > 0
@@ -625,9 +633,23 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			const initial = machine.queueInitialContinuation(Date.now());
 			persist();
 			try {
-				const message = objectiveMessage(goalObjective, machine.snapshot);
+				const snapshot = machine.snapshot;
+				pi.sendMessage(objectiveMessage(goalObjective, snapshot), { deliverAs: "followUp" });
 				pi.sendMessage(
-					{ ...message, details: { ...message.details, continuationNonce: initial.nonce } },
+					{
+						customType: GOAL_CONTINUATION_MESSAGE,
+						content: [
+							`Begin working autonomously toward: ${goalObjective}`,
+							"",
+							"Exact identity for every goal_* call (do not search for it elsewhere):",
+							`- goalId: ${snapshot.owner.goalId}`,
+							`- epoch: ${snapshot.owner.epoch}`,
+							"Use goal_subagent for delegated work, acknowledge every surfaced output, resolve unsuccessful work, and obtain a passing goal_review before completion.",
+							"After a passing review, use a prose-free goal_ack_output-only turn, then a separate prose-free goal_done-only turn. These are trivial protocol turns: suppress normal progress narration because any other post-review content invalidates that review.",
+						].join("\n"),
+						display: true,
+						details: { version: 1, owner: snapshot.owner, ticket: initial },
+					},
 					{ triggerTurn: true, deliverAs: "followUp" },
 				);
 			} catch (error) {
@@ -758,6 +780,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			"Run a fresh, structured, independent pi-subagents review bound to the current work generation.",
 		promptGuidelines: [
 			"Use goal_review only after all prior child outputs are acknowledged and all unsuccessful work is explicitly resolved.",
+			"After a passing review, do no further work. In a later assistant turn, acknowledge its output with only thinking and goal_ack_output—no prose or other tool calls. This is a trivial protocol turn; suppress normal progress narration.",
 		],
 		parameters: GoalReviewSchema,
 		async execute(toolCallId, params: GoalReviewInput, signal, _onUpdate, ctx) {
@@ -813,6 +836,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			"Complete the active goal only when every owned child is terminal, every output is acknowledged, failures are explicitly resolved, enabled budgets remain, and a current independent review passed.",
 		promptGuidelines: [
 			"Call goal_done only after goal_review passes and its output has been acknowledged in an earlier tool batch.",
+			"The review-acknowledgement turn and goal_done turn must contain only thinking plus their single goal tool call. Treat both as trivial protocol turns and suppress normal progress narration; prose or any other post-review work invalidates the review.",
 		],
 		parameters: GoalDoneSchema,
 		async execute(toolCallId, params: GoalDoneInput, _signal, _onUpdate, ctx) {

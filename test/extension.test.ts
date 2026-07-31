@@ -58,8 +58,15 @@ function details(result: ToolResultLike): GoalResultDetails {
 async function startGoal(harness: Harness, objective = "Complete safely"): Promise<GoalIdentity> {
 	await harness.start();
 	await harness.command(objective);
-	assert.equal(harness.sentMessages.length, 1);
-	return identity(harness);
+	assert.equal(harness.sentMessages.length, 2);
+	const owner = identity(harness);
+	assert.equal(harness.sentMessages[0]?.options?.triggerTurn, undefined);
+	assert.equal(harness.sentMessages[1]?.options?.triggerTurn, true);
+	const content = String(harness.sentMessages[1]?.message.content);
+	assert.ok(content.includes(`goalId: ${owner.goalId}`));
+	assert.ok(content.includes(`epoch: ${owner.epoch}`));
+	assert.match(content, /prose-free goal_ack_output-only turn/u);
+	return owner;
 }
 
 async function markInitialTurnRunning(harness: Harness): Promise<void> {
@@ -99,6 +106,18 @@ describe("Pi extension registration and ownership", () => {
 		]);
 		assert.equal(harness.commands.filter((command) => command.name === "goal").length, 1);
 		await harness.start();
+	});
+
+	it("surfaces exact identity and post-review sequencing to the parent", async () => {
+		const harness = createHarness();
+		const owner = await startGoal(harness);
+		const rewrites = await harness.emit("before_agent_start", { systemPrompt: "BASE" });
+		const rewrite = record(rewrites.find((value) => value !== undefined));
+		const prompt = String(rewrite.systemPrompt);
+		assert.ok(prompt.includes(`Goal ID: ${owner.goalId}`));
+		assert.ok(prompt.includes(`Goal epoch: ${owner.epoch}`));
+		assert.match(prompt, /tool-only assistant turn/u);
+		assert.match(prompt, /any other post-review content invalidates the review/u);
 	});
 
 	it("fails closed on a preexisting command or tool namespace", async () => {
@@ -504,11 +523,11 @@ describe("continuation races", () => {
 			agent: "worker",
 			task: "finish first",
 		});
-		assert.equal(harness.sentMessages.length, 1);
-		await harness.settle();
 		assert.equal(harness.sentMessages.length, 2);
 		await harness.settle();
-		assert.equal(harness.sentMessages.length, 2);
+		assert.equal(harness.sentMessages.length, 3);
+		await harness.settle();
+		assert.equal(harness.sentMessages.length, 3);
 	});
 
 	it("faults on paired stale agent_end and settlement after the next continuation starts", async () => {
@@ -528,23 +547,23 @@ describe("continuation races", () => {
 			entry.type === "message" ? [record(entry.message)] : [],
 		);
 		await harness.settle();
-		assert.equal(harness.sentMessages.length, 2);
+		assert.equal(harness.sentMessages.length, 3);
 		await harness.emit("agent_start", { type: "agent_start" });
 		await harness.emit("agent_start", { type: "agent_start" });
 		await harness.emit("agent_end", { type: "agent_end", messages: staleMessages });
 		await harness.emit("agent_settled", { type: "agent_settled" });
-		assert.equal(harness.sentMessages.length, 2);
+		assert.equal(harness.sentMessages.length, 3);
 		const snapshot = latestSnapshot(harness);
 		assert.equal(snapshot.phase, "faulted");
 		assert.match(snapshot.faultReason ?? "", /continuation nonce/u);
 	});
 
 	it("faults without retry when Pi rejects a committed continuation", async () => {
-		const harness = createHarness({ sendMessageFailureAt: 2 });
+		const harness = createHarness({ sendMessageFailureAt: 3 });
 		await startGoal(harness);
 		await markInitialTurnRunning(harness);
 		await harness.settle();
-		assert.equal(harness.sentMessages.length, 1);
+		assert.equal(harness.sentMessages.length, 2);
 		const snapshot = latestSnapshot(harness);
 		assert.equal(snapshot.phase, "faulted");
 		assert.match(snapshot.faultReason ?? "", /synthetic send failure/u);
@@ -568,7 +587,7 @@ describe("continuation races", () => {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		assert.ok(pending);
 		await harness.settle();
-		assert.equal(harness.sentMessages.length, 1);
+		assert.equal(harness.sentMessages.length, 2);
 
 		const requestId = pending.requestId;
 		const ownerRunId = pending.ownerRunId;
@@ -591,17 +610,18 @@ describe("continuation races", () => {
 			result: { kind: "text", text: `late-output:${"😀".repeat(20_000)}` },
 		});
 		const work = details(await workPromise);
-		assert.equal(harness.sentMessages.length, 2);
-		const continuationContent = String(harness.sentMessages[1]?.message.content);
+		assert.equal(harness.sentMessages.length, 3);
+		const continuationContent = String(harness.sentMessages[2]?.message.content);
 		assert.match(continuationContent, /late-output/u);
 		assert.match(continuationContent, /Output truncated/u);
 		assert.ok(Buffer.byteLength(continuationContent, "utf8") <= 48_000);
-		assert.match(
-			String(harness.sentMessages[1]?.message.content),
-			new RegExp(work.acknowledgements[0]?.ackToken ?? "missing", "u"),
+		assert.ok(
+			String(harness.sentMessages[2]?.message.content).includes(
+				work.acknowledgements[0]?.ackToken ?? "missing",
+			),
 		);
 		await harness.settle();
-		assert.equal(harness.sentMessages.length, 2);
+		assert.equal(harness.sentMessages.length, 3);
 	});
 });
 
