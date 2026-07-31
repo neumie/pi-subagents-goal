@@ -367,6 +367,23 @@ describe("ownership and lifecycle", () => {
 });
 
 describe("finite budgets", () => {
+	it("leaves token and wall-clock limits disabled by default", () => {
+		const target = machine();
+		assert.equal(target.snapshot.budgetLimits.maxTokens, null);
+		assert.equal(target.snapshot.budgetLimits.maxWallClockMs, null);
+		target.recordTurn({ tokens: 2_000_000, progressSignature: "large-existing-context", now: NOW + 1 });
+		assert.equal(target.snapshot.budgetUsage.tokens, 2_000_000);
+		assert.equal(target.snapshot.phase, "active");
+		target.admitWork({
+			itemId: "late-work",
+			mode: "single",
+			role: "work",
+			label: "late",
+			now: NOW + 365 * 24 * 60 * 60 * 1_000,
+		});
+		assert.equal(target.snapshot.phase, "active");
+	});
+
 	it("exhausts the automatic turn budget exactly at the limit", () => {
 		const target = machine({ maxAutomaticTurns: 2, maxNoProgressTurns: 10 });
 		target.queueInitialContinuation(NOW + 1);

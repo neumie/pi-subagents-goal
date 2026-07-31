@@ -20,6 +20,13 @@ import {
 	persistenceSnapshot,
 	type SessionEntryLike,
 } from "./persistence.ts";
+import {
+	GOAL_STATUS_EVENT,
+	GOAL_STATUS_REQUEST_EVENT,
+	createGoalStatusEnvelope,
+	isGoalStatusRequest,
+	type GoalStatusEnvelope,
+} from "./status-api.ts";
 import { SubagentBridge, SubagentBridgeError, type SubagentCompatibility } from "./subagents-bridge.ts";
 import { MAX_MODEL_TEXT_BYTES, equalPreviewByteLimit, truncateUtf8, utf8ByteLength } from "./text-budget.ts";
 import {
@@ -35,7 +42,6 @@ import {
 	type OwnerIdentity,
 } from "./state.ts";
 
-const STATUS_KEY = "pi-subagents-goal";
 const MAX_OBJECTIVE_BYTES = 10_000;
 const CONTINUATION_TRUNCATION_MARKER =
 	"\n[Child preview truncated; inspect its child session before acknowledgement if omitted evidence matters.]";
@@ -284,19 +290,11 @@ function currentAssistantHasAckSibling(ctx: ExtensionContext, currentToolCallId:
 	return true;
 }
 
-function turnTokens(event: TurnEndEvent): number {
+function turnOutputTokens(event: TurnEndEvent): number {
 	const message = event.message as unknown;
 	if (!isRecord(message) || !isRecord(message.usage)) return 0;
-	if (typeof message.usage.totalTokens === "number") return message.usage.totalTokens;
-	return [
-		message.usage.input,
-		message.usage.output,
-		message.usage.cacheRead,
-		message.usage.cacheWrite,
-	].reduce<number>(
-		(total, value) => total + (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0),
-		0,
-	);
+	const output = message.usage.output;
+	return typeof output === "number" && Number.isFinite(output) && output > 0 ? output : 0;
 }
 
 function turnProgressSignature(event: TurnEndEvent): string {
@@ -308,21 +306,6 @@ function turnProgressSignature(event: TurnEndEvent): string {
 		text: outputText(result.content).slice(0, 1_000),
 	}));
 	return sha256(JSON.stringify({ assistant: assistant.slice(0, 4_000), tools }));
-}
-
-function formatStatus(snapshot: GoalSnapshot | undefined): string {
-	if (!snapshot) return "No goal is active.";
-	const active = snapshot.work.filter((item) => isActiveWorkState(item.state)).length;
-	const unread = snapshot.work.filter(
-		(item) => isTerminalWorkState(item.state) && item.outputState !== "consumed",
-	).length;
-	return [
-		`Goal ${snapshot.owner.goalId} epoch ${snapshot.owner.epoch}: ${snapshot.phase}`,
-		`Work: ${snapshot.work.length} total, ${active} nonterminal, ${unread} unconsumed`,
-		`Budget: ${snapshot.budgetUsage.automaticTurns}/${snapshot.budgetLimits.maxAutomaticTurns} automatic turns, ${snapshot.budgetUsage.tokens}/${snapshot.budgetLimits.maxTokens} tokens, ${snapshot.budgetUsage.noProgressTurns}/${snapshot.budgetLimits.maxNoProgressTurns} unchanged turns`,
-		...(snapshot.pauseReason ? [`Reason: ${snapshot.pauseReason}`] : []),
-		...(snapshot.faultReason ? [`Fault: ${snapshot.faultReason}`] : []),
-	].join("\n");
 }
 
 function completionError(blockers: string[]): GoalInvariantError {
@@ -346,7 +329,7 @@ function extensionSystemPrompt(objective: string, snapshot: GoalSnapshot): strin
 		"After each child result, consider it and call goal_ack_output with its exact acknowledgement token. Explicitly resolve unsuccessful child outcomes with goal_resolve.",
 		"Before completion, call goal_review for a fresh independent structured review, acknowledge that review output, and address every blocker.",
 		"Call goal_done only with every exact considered item ID and the current passing review token. Prose never completes the goal.",
-		"Finite automatic-turn, token, wall-clock, and no-progress budgets are enforced by the extension.",
+		"Automatic-turn and no-progress budgets are enabled by default; token and wall-clock limits are optional.",
 	].join("\n");
 }
 
@@ -359,6 +342,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	let compatibility: SubagentCompatibility | undefined;
 	let compatibilitySessionId: string | undefined;
 	const outputCache = new Map<string, string>();
+	const statusProviderId = randomUUID();
+	let statusSequence = 0;
+	let latestStatus: GoalStatusEnvelope | undefined;
 	let runtimeEpoch = 0;
 
 	const assertNamespace = () => {
@@ -367,15 +353,33 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	const persist = () => {
 		if (machine) pi.appendEntry(GOAL_STATE_ENTRY, persistenceSnapshot(machine.snapshot));
 	};
-	const updateStatus = (ctx: ExtensionContext) => {
-		const snapshot = machine?.snapshot;
-		ctx.ui.setStatus(
-			STATUS_KEY,
-			snapshot && isLivePhase(snapshot.phase)
-				? `${snapshot.phase} · ${snapshot.work.filter((item) => isActiveWorkState(item.state)).length} child`
-				: undefined,
-		);
+	const emitStatus = (status: GoalStatusEnvelope) => {
+		try {
+			pi.events.emit(GOAL_STATUS_EVENT, structuredClone(status));
+		} catch {
+			// Status consumers are optional and cannot affect goal coordination.
+		}
 	};
+	const publishStatus = (ctx: ExtensionContext) => {
+		latestStatus = createGoalStatusEnvelope({
+			providerId: statusProviderId,
+			sequence: ++statusSequence,
+			sessionId: ctx.sessionManager.getSessionId(),
+			...(objective !== undefined ? { objective } : {}),
+			...(machine ? { snapshot: machine.snapshot } : {}),
+			...(namespaceFault
+				? {
+						providerError:
+							"Goal provider unavailable because namespace or persisted state validation failed.",
+					}
+				: {}),
+		});
+		emitStatus(latestStatus);
+	};
+	pi.events.on(GOAL_STATUS_REQUEST_EVENT, (request) => {
+		if (!isGoalStatusRequest(request) || request.sessionId !== latestStatus?.sessionId) return;
+		emitStatus(latestStatus);
+	});
 	const requireMachine = (ctx?: ExtensionContext) => {
 		assertNamespace();
 		if (!machine || !objective || !isLivePhase(machine.snapshot.phase)) {
@@ -415,7 +419,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		const ticket = suppliedTicket ?? machine.reserveContinuation(Date.now());
 		if (!ticket) {
 			persist();
-			updateStatus(ctx);
+			publishStatus(ctx);
 			return false;
 		}
 		const snapshot = machine.snapshot;
@@ -427,7 +431,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			if (!item?.ackToken || output === undefined) {
 				machine.fault(`Terminal output for ${itemId} could not be re-surfaced safely.`, Date.now());
 				persist();
-				updateStatus(ctx);
+				publishStatus(ctx);
 				return false;
 			}
 			outputs.push({ header: `[${itemId}] ${item.label}: ${item.state}`, output });
@@ -459,15 +463,16 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		if (utf8ByteLength(continuationContent) > MAX_MODEL_TEXT_BYTES) {
 			machine.fault("Bounded continuation exceeded its UTF-8 safety budget.", Date.now());
 			persist();
-			updateStatus(ctx);
+			publishStatus(ctx);
 			return false;
 		}
 		if (!machine.commitContinuation(ticket, Date.now())) {
 			persist();
-			updateStatus(ctx);
+			publishStatus(ctx);
 			return false;
 		}
 		persist();
+		publishStatus(ctx);
 		try {
 			pi.sendMessage(
 				{
@@ -489,7 +494,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 				Date.now(),
 			);
 			persist();
-			updateStatus(ctx);
+			publishStatus(ctx);
 			return false;
 		}
 	};
@@ -559,17 +564,11 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		} else {
 			machine = undefined;
 			objective = undefined;
-			if (loaded.kind === "foreign") {
-				ctx.ui.notify(
-					"Inherited goal metadata belongs to another session/fork and has no authority here.",
-					"warning",
-				);
-			} else if (loaded.kind === "invalid") {
+			if (loaded.kind === "invalid") {
 				namespaceFault = `Goal metadata failed closed: ${loaded.reason}`;
-				ctx.ui.notify(namespaceFault, "error");
 			}
 		}
-		updateStatus(ctx);
+		publishStatus(ctx);
 		void ensureCompatibility(ctx).catch(() => {
 			// Foreground tools report the actionable compatibility error when called.
 		});
@@ -578,78 +577,69 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	pi.registerCommand("goal", {
 		description: "Start or control the native pi-subagents-aware goal loop",
 		handler: async (args, ctx) => {
-			try {
-				assertNamespace();
-				const trimmed = args.trim();
-				const command = trimmed.toLowerCase();
-				if (!trimmed || command === "status") {
-					ctx.ui.notify(formatStatus(machine?.snapshot), "info");
-					return;
-				}
-				if (command === "pause") {
-					const active = requireMachine(ctx);
-					if (!active.pause("Paused explicitly by the user.", Date.now()))
-						throw new GoalInvariantError("Goal cannot be paused from its current phase.");
-					persist();
-					if (!ctx.isIdle()) ctx.abort();
-					updateStatus(ctx);
-					return;
-				}
-				if (command === "resume") {
-					const active = requireMachine(ctx);
-					if (!active.resume(Date.now()))
-						throw new GoalInvariantError(
-							"Goal cannot resume while work is active or the phase is not paused.",
-						);
-					persist();
-					updateStatus(ctx);
-					dispatchContinuation(ctx);
-					return;
-				}
-				if (command === "cancel" || command === "clear") {
-					const active = requireMachine(ctx);
-					active.cancel(Date.now());
-					persist();
-					if (!ctx.isIdle()) ctx.abort();
-					updateStatus(ctx);
-					ctx.ui.notify(
-						"Goal cancellation recorded. Active children must reach an explicit terminal state.",
-						"warning",
-					);
-					return;
-				}
-				if (machine && isLivePhase(machine.snapshot.phase))
-					throw new GoalInvariantError("This session already has a live goal.");
-				if (!ctx.isIdle()) throw new GoalInvariantError("Wait for Pi to settle before starting /goal.");
-				const goalObjective = trimmed.startsWith("start ") ? trimmed.slice(6).trim() : trimmed;
-				if (!goalObjective) throw new GoalInvariantError("Usage: /goal <objective>");
-				if (utf8ByteLength(goalObjective) > MAX_OBJECTIVE_BYTES) {
-					throw new GoalInvariantError(`Goal objective must be at most ${MAX_OBJECTIVE_BYTES} UTF-8 bytes.`);
-				}
-				machine = new GoalMachine(
-					createGoalSnapshot({ owner: ownerForContext(ctx), objective: goalObjective, now: Date.now() }),
-				);
-				objective = goalObjective;
-				const initial = machine.queueInitialContinuation(Date.now());
-				persist();
-				try {
-					const message = objectiveMessage(goalObjective, machine.snapshot);
-					pi.sendMessage(
-						{ ...message, details: { ...message.details, continuationNonce: initial.nonce } },
-						{ triggerTurn: true, deliverAs: "followUp" },
-					);
-				} catch (error) {
-					machine.fault(
-						`Initial goal turn could not be queued: ${error instanceof Error ? error.message : String(error)}`,
-						Date.now(),
-					);
-					persist();
-					throw error;
-				}
-				updateStatus(ctx);
-			} catch (error) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			assertNamespace();
+			const trimmed = args.trim();
+			const command = trimmed.toLowerCase();
+			if (!trimmed || command === "status") {
+				publishStatus(ctx);
+				return;
 			}
+			if (command === "pause") {
+				const active = requireMachine(ctx);
+				if (!active.pause("Paused explicitly by the user.", Date.now()))
+					throw new GoalInvariantError("Goal cannot be paused from its current phase.");
+				persist();
+				if (!ctx.isIdle()) ctx.abort();
+				publishStatus(ctx);
+				return;
+			}
+			if (command === "resume") {
+				const active = requireMachine(ctx);
+				if (!active.resume(Date.now()))
+					throw new GoalInvariantError("Goal cannot resume while work is active or the phase is not paused.");
+				persist();
+				publishStatus(ctx);
+				dispatchContinuation(ctx);
+				return;
+			}
+			if (command === "cancel" || command === "clear") {
+				const active = requireMachine(ctx);
+				active.cancel(Date.now());
+				persist();
+				if (!ctx.isIdle()) ctx.abort();
+				publishStatus(ctx);
+				return;
+			}
+			if (machine && isLivePhase(machine.snapshot.phase))
+				throw new GoalInvariantError("This session already has a live goal.");
+			if (!ctx.isIdle()) throw new GoalInvariantError("Wait for Pi to settle before starting /goal.");
+			const goalObjective = trimmed.startsWith("start ") ? trimmed.slice(6).trim() : trimmed;
+			if (!goalObjective) throw new GoalInvariantError("Usage: /goal <objective>");
+			if (utf8ByteLength(goalObjective) > MAX_OBJECTIVE_BYTES) {
+				throw new GoalInvariantError(`Goal objective must be at most ${MAX_OBJECTIVE_BYTES} UTF-8 bytes.`);
+			}
+			machine = new GoalMachine(
+				createGoalSnapshot({ owner: ownerForContext(ctx), objective: goalObjective, now: Date.now() }),
+			);
+			objective = goalObjective;
+			const initial = machine.queueInitialContinuation(Date.now());
+			persist();
+			try {
+				const message = objectiveMessage(goalObjective, machine.snapshot);
+				pi.sendMessage(
+					{ ...message, details: { ...message.details, continuationNonce: initial.nonce } },
+					{ triggerTurn: true, deliverAs: "followUp" },
+				);
+			} catch (error) {
+				machine.fault(
+					`Initial goal turn could not be queued: ${error instanceof Error ? error.message : String(error)}`,
+					Date.now(),
+				);
+				persist();
+				publishStatus(ctx);
+				throw error;
+			}
+			publishStatus(ctx);
 		},
 	});
 
@@ -718,7 +708,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			}
 			machine = candidate;
 			persist();
-			updateStatus(ctx);
+			publishStatus(ctx);
 			return {
 				content: [{ type: "text", text: `Acknowledged ${params.items.length} goal-owned output item(s).` }],
 				details: { version: 1, itemIds: params.items.map((item) => item.itemId) },
@@ -748,6 +738,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 				);
 			}
 			persist();
+			publishStatus(ctx);
 			return {
 				content: [
 					{
@@ -819,7 +810,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		name: "goal_done",
 		label: "Goal Done",
 		description:
-			"Complete the active goal only when every owned child is terminal, every output is acknowledged, failures are explicitly resolved, finite budgets remain, and a current independent review passed.",
+			"Complete the active goal only when every owned child is terminal, every output is acknowledged, failures are explicitly resolved, enabled budgets remain, and a current independent review passed.",
 		promptGuidelines: [
 			"Call goal_done only after goal_review passes and its output has been acknowledged in an earlier tool batch.",
 		],
@@ -841,8 +832,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			const decision = active.complete(request);
 			if (!decision.ok) throw completionError(decision.blockers);
 			persist();
-			updateStatus(ctx);
-			ctx.ui.notify("Goal completed after all coordination and review gates passed.", "info");
+			publishStatus(ctx);
 			return {
 				content: [{ type: "text", text: `Goal complete.\n\n${params.summary}` }],
 				details: { version: 1, goalId: params.goalId, epoch: params.epoch, status: "completed" },
@@ -880,7 +870,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		}
 		if (machine.markOutputSurfaced(owner, details.itemIds, Date.now())) {
 			persist();
-			updateStatus(ctx);
+			publishStatus(ctx);
 			dispatchContinuation(ctx);
 		}
 	});
@@ -894,7 +884,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		if (!machine) return;
 		machine.agentStarted(Date.now());
 		persist();
-		updateStatus(ctx);
+		publishStatus(ctx);
 	});
 
 	pi.on("agent_end", (event, ctx) => {
@@ -917,66 +907,50 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			);
 		}
 		persist();
-		updateStatus(ctx);
+		publishStatus(ctx);
 	});
 
 	pi.on("turn_end", (event, ctx) => {
 		if (!machine) return;
 		machine.recordTurn({
-			tokens: turnTokens(event),
+			tokens: turnOutputTokens(event),
 			progressSignature: turnProgressSignature(event),
 			now: Date.now(),
 		});
 		persist();
-		updateStatus(ctx);
+		publishStatus(ctx);
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
 		if (!machine) return;
 		const ticket = machine.agentSettled(Date.now());
 		persist();
-		updateStatus(ctx);
+		publishStatus(ctx);
 		if (ticket) dispatchContinuation(ctx, ticket);
 	});
 
-	pi.on("session_before_switch", (_event, ctx) => {
+	pi.on("session_before_switch", () => {
 		if (!machine || !isLivePhase(machine.snapshot.phase)) return;
-		ctx.ui.notify(
-			"Session switch blocked while /goal has live or unresolved state. Complete or cancel it first.",
-			"warning",
-		);
 		return { cancel: true };
 	});
 
-	pi.on("session_before_fork", (_event, ctx) => {
+	pi.on("session_before_fork", () => {
 		if (!machine || !isLivePhase(machine.snapshot.phase)) return;
-		ctx.ui.notify(
-			"Fork/clone blocked while /goal has live or unresolved state. Complete or cancel it first.",
-			"warning",
-		);
 		return { cancel: true };
 	});
 
-	pi.on("session_before_tree", (_event, ctx) => {
+	pi.on("session_before_tree", () => {
 		if (!machine || !isLivePhase(machine.snapshot.phase)) return;
-		ctx.ui.notify(
-			"Tree navigation blocked while /goal has live or unresolved state. Complete or cancel it first.",
-			"warning",
-		);
 		return { cancel: true };
 	});
 
-	pi.on("session_before_compact", (_event, ctx) => {
+	pi.on("session_before_compact", () => {
 		if (!machine || !isLivePhase(machine.snapshot.phase)) return;
 		const unsafe = machine.snapshot.work.some(
 			(item) =>
 				isActiveWorkState(item.state) || (isTerminalWorkState(item.state) && item.outputState !== "consumed"),
 		);
 		if (!unsafe) return;
-		ctx.ui.notify(
-			"Compaction blocked until all goal-owned work is terminal and its output acknowledged.",
-			"warning",
-		);
 		return { cancel: true };
 	});
 
@@ -990,14 +964,15 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			machine.pause(`Session shutdown (${event.reason}); explicit recovery is required.`, Date.now());
 			persist();
 		}
+		publishStatus(ctx);
 		if (closingEpoch === runtimeEpoch) {
 			bridge.dispose();
 			bridge = new SubagentBridge(pi.events);
 			compatibility = undefined;
 			compatibilitySessionId = undefined;
 			currentCtx = undefined;
+			latestStatus = undefined;
 		}
-		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 
 	void currentCtx;

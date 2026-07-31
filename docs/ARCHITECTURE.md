@@ -18,7 +18,7 @@ A pure, serializable state machine owns all safety invariants:
 - output digests, surfacing state, and acknowledgement tokens;
 - unsuccessful-outcome resolutions;
 - continuation reservation/commit state;
-- finite budget use;
+- enabled budget use and optional token/time limits;
 - independent review evidence;
 - runtime validation of restored snapshots.
 
@@ -49,7 +49,8 @@ Important ordering:
 4. cache terminal output before notifying the continuation adapter;
 5. map every response to an explicit terminal state;
 6. account delegated token usage before continuation eligibility is checked;
-7. return every acknowledgement token outside truncated previews.
+7. count parent token usage from newly generated output only, never pre-existing context;
+8. return every acknowledgement token outside truncated previews.
 
 Parallel concurrency is bounded at four. Chains replace `{previous}` with the preceding output and explicitly stop all unstarted suffix items after a failure.
 
@@ -64,9 +65,10 @@ The adapter owns side effects:
 - lifecycle guards and recovery;
 - namespace verification after Pi binds runtime actions;
 - continuation `sendMessage()` calls;
-- branch-local review freshness checks.
+- branch-local review freshness checks;
+- a versioned, session-scoped, display-safe status API.
 
-No other goal extension is required or supported.
+The adapter performs no direct UI writes. `pi-sidebar` and `pi-footer` own optional presentation by consuming status events. No other goal extension is required or supported.
 
 ## Ownership
 
@@ -129,7 +131,7 @@ Eligibility requires:
 - no existing continuation;
 - no nonterminal child;
 - no output still `awaiting`;
-- all finite budgets below their limits.
+- all enabled budgets below their limits.
 
 Reservation and dispatch are separate:
 
@@ -210,7 +212,13 @@ Those values remain in normal Pi messages/tool results. Snapshot fields retain o
 | `session_start` clean paused state | restore; explicit resume required |
 | `session_start` nonterminal child | fault |
 | `session_start` ambiguous continuation | fault |
-| foreign session/fork metadata | ignore authority and warn |
+| foreign session/fork metadata | ignore authority |
+
+## Status API
+
+`src/status-api.ts` publishes `@neumie/pi-subagents-goal:v1:status` and accepts exact-session replay requests on `@neumie/pi-subagents-goal:v1:status-request`. Every envelope carries a provider-instance ID and monotonic sequence so consumers can reject stale updates and survive extension load-order changes.
+
+The display-safe payload includes objective, phase, timestamps, work aggregates, at most 128 recent bounded labels plus an omitted count, optional limits and aggregate usage, continuation/review state, and a generic bounded reason. It omits session files, lineage/goal/item IDs, acknowledgement and review tokens, internal progress signatures, digests, prompts, findings, raw faults, and child output. Emission is isolated from coordination: malformed requests and throwing listeners are ignored. The goal extension never calls Pi status, widget, footer, or notification APIs.
 
 ## Supported and unsupported coordination
 
