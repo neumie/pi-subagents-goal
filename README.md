@@ -90,14 +90,25 @@ Item IDs are globally unique within a goal and are never reused across attempts.
 
 The extension commits the continuation ledger before calling Pi's `sendMessage(..., { triggerTurn: true })`. A synchronous enqueue failure faults the goal and is not retried. If a process reload restores a `reserved`, `queued`, or `running` continuation, delivery is ambiguous and the goal faults instead of risking a duplicate. This is exactly-once within an unambiguous live runtime and fail-closed across the remaining Pi crash window.
 
-Default finite budgets are:
+Default goal budgets are:
 
 - 20 automatic continuation turns;
-- 1,000,000 tokens across every parent turn plus delegated usage;
-- 120 minutes wall clock;
+- no token limit;
+- no wall-clock limit;
 - 3 unchanged automatic turns.
 
-Foreground children default to a 10-minute timeout and `24 + 2` turn/grace budget. Limits are validated and cannot be unlimited.
+When an explicit token limit is supplied through the state-machine API, usage counts only parent output generated after goal start plus delegated child usage; pre-existing parent context is not charged. Explicit token and wall-clock limits must be positive finite integers. Foreground children retain a 10-minute timeout and `24 + 2` turn/grace budget.
+
+## Status API and presentation ownership
+
+This extension performs no direct UI writes: it does not call `ctx.ui.setStatus()`, `ctx.ui.notify()`, `ctx.ui.setWidget()`, or `ctx.ui.setFooter()`. Slash-command errors propagate to Pi. Presentation belongs to optional consumers such as `pi-sidebar` and `pi-footer`.
+
+The provider publishes a versioned, session-scoped, process-local protocol:
+
+- request: `@neumie/pi-subagents-goal:v1:status-request` with `{ version: 1, sessionId }`;
+- state: `@neumie/pi-subagents-goal:v1:status` with `{ version, providerId, sequence, sessionId, goal, providerError? }`.
+
+Consumers receive objective, phase, timestamps, work counts, at most 128 recent bounded labels plus an omitted count, enabled limits and aggregate usage, continuation/review state, and a generic bounded reason. The payload deliberately omits session files, lineage and goal IDs, item IDs, acknowledgement/review tokens, internal progress signatures, digests, and child output. Requests are exact-session only, repeated state is monotonic per provider instance, malformed consumers cannot affect coordination, and package load order is handled through replay requests plus session-start publication.
 
 ## Persistence and recovery
 

@@ -11,7 +11,7 @@ This model covers coordination safety for `pi-subagents-goal` running in one Pi 
 - **Work ledger integrity** — complete and accurate child lifecycle records.
 - **Output-consumption evidence** — proof that terminal output entered context and was explicitly considered.
 - **Completion evidence** — a current independent review tied to the latest work generation.
-- **Budget integrity** — finite turn, token, wall-clock, and no-progress accounting.
+- **Budget integrity** — finite turn/no-progress accounting plus optional token and wall-clock limits.
 - **Session confidentiality** — objective and child output values must not leak into hidden coordination metadata.
 
 ## Trust assumptions
@@ -61,13 +61,15 @@ A malicious extension loaded into the same Pi process is inside the trust bounda
 | Fork inherits authority | Exact session ID/file validation; switch/fork/tree blocked while live |
 | Unsafe compaction removes evidence | Compaction blocked with nonterminal work or unconsumed output |
 | Reload loses foreground child | Restore with a nonterminal child faults |
-| Unlimited autonomy | Validated finite parent and child budgets; no unlimited values |
-| Parent or child token cost bypasses budget | Every parent turn adds tokens; automatic-only gating applies only to turn/no-progress counters; delegated terminal usage is added before continuation eligibility, including while paused/cancelling |
+| Unlimited autonomy | Parent automatic-turn/no-progress and child timeout/turn budgets remain finite by default; token and wall-clock caps are explicitly optional |
+| Pre-existing context exhausts a goal cap | Parent accounting uses newly generated output only; delegated terminal usage is added before continuation eligibility, including while paused/cancelling |
 | Oversized output hides tokens | Per-child and aggregate previews bounded; every token emitted in a separate untruncated list |
 | Malformed persisted metadata | Field-by-field and cross-field lifecycle validation; no trusted cast |
 | Objective leaks into hidden metadata | Snapshot stores only objective digest; objective value is a normal displayed session message |
 | Goal namespace is shadowed | Session-start verification of `/goal` count and active tool source paths |
 | Extension factory calls unbound Pi actions | Registration performs no runtime action calls; exact Pi loader smoke enforces this |
+| Status API exposes coordination capabilities | Display payload omits owner/item IDs, session files, acknowledgement/review tokens, digests, prompts, findings, and child output |
+| Hostile status consumer breaks coordination | Status requests are validated and listener failures are isolated from goal state transitions |
 | Dependency/protocol drift | Exact peer/dev pins, lockfile, exact-version loader smoke, real-local contract smoke |
 
 ## Output and token handling
@@ -92,7 +94,7 @@ The prompt makes the reviewer read-only and asks for source-backed findings. Ope
 1. **No transactional Pi enqueue.** `appendEntry` and `sendMessage` are separate calls. The extension persists `queued` first and faults ambiguous restore, yielding fail-closed at-most-one recovery rather than guaranteed progress after a crash.
 2. **Same-process spoofing.** Another malicious Pi extension can forge public event-bus messages, shadow tools, or call session APIs. Source-path namespace checks do not sandbox extensions.
 3. **Foreground child side effects.** Cancellation or timeout cannot roll back filesystem/network changes already made by a child.
-4. **Usage accuracy.** Token budgets rely on Pi and `pi-subagents` usage reports. Missing usage counts as zero; wall-clock/turn limits remain independent backstops.
+4. **Usage accuracy.** Explicit token caps rely on Pi parent-output and `pi-subagents` usage reports. Missing usage counts as zero. Token and wall-clock caps are disabled by default; automatic-turn/no-progress and child limits remain independent backstops.
 5. **Model-facing output bounds.** Preview truncation may require manual/session inspection before a truthful acknowledgement.
 6. **Clean-shutdown semantics.** A clean shutdown pauses and permits explicit resume because Pi is expected to abort the active turn. If the host violates that assumption, a user should cancel rather than resume.
 7. **Local upstream availability.** The smoke pins the local commit and requires a clean worktree, but reproducibility still depends on the configured absolute checkout being available (or `PI_SUBAGENTS_LOCAL_PATH` pointing to an equivalent clean checkout).

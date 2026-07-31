@@ -4,10 +4,10 @@ export const GOAL_STATE_VERSION = 1 as const;
 
 export const DEFAULT_BUDGET_LIMITS = Object.freeze({
 	maxAutomaticTurns: 20,
-	maxTokens: 1_000_000,
-	maxWallClockMs: 2 * 60 * 60 * 1_000,
+	maxTokens: null,
+	maxWallClockMs: null,
 	maxNoProgressTurns: 3,
-});
+} satisfies BudgetLimits);
 
 export type GoalPhase =
 	| "active"
@@ -51,8 +51,8 @@ export interface OwnerIdentity {
 
 export interface BudgetLimits {
 	maxAutomaticTurns: number;
-	maxTokens: number;
-	maxWallClockMs: number;
+	maxTokens: number | null;
+	maxWallClockMs: number | null;
 	maxNoProgressTurns: number;
 }
 
@@ -269,8 +269,8 @@ function assertFinitePositiveInteger(value: number, field: string): void {
 
 function validateBudgetLimits(limits: BudgetLimits): void {
 	assertFinitePositiveInteger(limits.maxAutomaticTurns, "maxAutomaticTurns");
-	assertFinitePositiveInteger(limits.maxTokens, "maxTokens");
-	assertFinitePositiveInteger(limits.maxWallClockMs, "maxWallClockMs");
+	if (limits.maxTokens !== null) assertFinitePositiveInteger(limits.maxTokens, "maxTokens");
+	if (limits.maxWallClockMs !== null) assertFinitePositiveInteger(limits.maxWallClockMs, "maxWallClockMs");
 	assertFinitePositiveInteger(limits.maxNoProgressTurns, "maxNoProgressTurns");
 }
 
@@ -762,13 +762,13 @@ export class GoalMachine {
 		const usage = this.#state.budgetUsage;
 		const exhausted =
 			usage.automaticTurns >= limits.maxAutomaticTurns ||
-			usage.tokens >= limits.maxTokens ||
+			(limits.maxTokens !== null && usage.tokens >= limits.maxTokens) ||
 			usage.noProgressTurns >= limits.maxNoProgressTurns ||
-			now - this.#state.startedAt >= limits.maxWallClockMs;
+			(limits.maxWallClockMs !== null && now - this.#state.startedAt >= limits.maxWallClockMs);
 		if (!exhausted) return;
 		this.#state.phase = "budget_exhausted";
 		this.#state.pauseReason =
-			"A finite automatic-turn, token, wall-clock, or no-progress budget was exhausted.";
+			"An enabled automatic-turn, token, wall-clock, or no-progress budget was exhausted.";
 		this.#state.currentRunAutomatic = false;
 		this.#state.currentRunEndObserved = false;
 		delete this.#state.continuation;

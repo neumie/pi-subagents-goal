@@ -6,6 +6,7 @@ import {
 	loadGoalFromBranch,
 	type SessionEntryLike,
 } from "../src/persistence.ts";
+import { GOAL_STATUS_EVENT, GOAL_STATUS_REQUEST_EVENT, type GoalStatusEnvelope } from "../src/status-api.ts";
 import {
 	SUBAGENT_DELEGATION_RESPONSE,
 	SUBAGENT_DELEGATION_STARTED,
@@ -103,15 +104,54 @@ describe("Pi extension registration and ownership", () => {
 	it("fails closed on a preexisting command or tool namespace", async () => {
 		const commandConflict = createHarness({ preexistingGoalCommand: true });
 		await commandConflict.start();
-		await commandConflict.command("objective");
-		assert.match(commandConflict.notifications.at(-1)?.message ?? "", /namespace|Another extension/u);
+		await assert.rejects(commandConflict.command("objective"), /namespace|Another extension/u);
 		assert.equal(commandConflict.sentMessages.length, 0);
+		assert.deepEqual(commandConflict.notifications, []);
 
 		const toolConflict = createHarness({ preexistingGoalTool: "goal_done" });
 		await toolConflict.start();
-		await toolConflict.command("objective");
-		assert.match(toolConflict.notifications.at(-1)?.message ?? "", /namespace.*(?:active|conflict)/u);
+		await assert.rejects(toolConflict.command("objective"), /namespace.*(?:active|conflict)/u);
 		assert.equal(toolConflict.sentMessages.length, 0);
+		assert.deepEqual(toolConflict.notifications, []);
+	});
+
+	it("publishes session-scoped status without writing Pi UI", async () => {
+		const harness = createHarness();
+		const statuses: GoalStatusEnvelope[] = [];
+		harness.events.on(GOAL_STATUS_EVENT, (value) => statuses.push(value as GoalStatusEnvelope));
+
+		await harness.start();
+		assert.equal(statuses.at(-1)?.goal, null);
+		await harness.command("Status API smoke");
+		const active = statuses.at(-1);
+		assert.equal(active?.sessionId, "session-harness");
+		assert.equal(active?.goal?.phase, "active");
+		assert.equal(active?.goal?.objective, "Status API smoke");
+		assert.equal(active?.goal?.budget.limits.maxTokens, null);
+		assert.equal(active?.goal?.budget.limits.maxWallClockMs, null);
+
+		const count = statuses.length;
+		harness.events.emit(GOAL_STATUS_REQUEST_EVENT, { version: 1, sessionId: "foreign" });
+		harness.events.emit(
+			GOAL_STATUS_REQUEST_EVENT,
+			new Proxy(
+				{},
+				{
+					get: () => {
+						throw new Error("bad");
+					},
+				},
+			),
+		);
+		assert.equal(statuses.length, count);
+		harness.events.emit(GOAL_STATUS_REQUEST_EVENT, { version: 1, sessionId: "session-harness" });
+		assert.equal(statuses.length, count + 1);
+		assert.equal(statuses.at(-1)?.sequence, active?.sequence);
+
+		await harness.command("status");
+		assert.ok((statuses.at(-1)?.sequence ?? 0) > (active?.sequence ?? 0));
+		assert.deepEqual(harness.notifications, []);
+		assert.equal(harness.statuses.size, 0);
 	});
 
 	it("blocks only direct subagent calls while a live goal owns delegation", async () => {
@@ -429,7 +469,7 @@ describe("foreground goal flow", () => {
 });
 
 describe("continuation races", () => {
-	it("counts the initial parent turn toward the token budget", async () => {
+	it("counts only new parent output and leaves the token cap disabled", async () => {
 		const harness = createHarness();
 		await startGoal(harness);
 		await markInitialTurnRunning(harness);
@@ -438,14 +478,20 @@ describe("continuation races", () => {
 			message: {
 				role: "assistant",
 				content: [{ type: "text", text: "initial work" }],
-				usage: { totalTokens: 1_000_000 },
+				usage: {
+					input: 1_100_000,
+					output: 17,
+					cacheRead: 900_000,
+					totalTokens: 2_000_017,
+				},
 			},
 			toolResults: [],
 		});
 		const snapshot = latestSnapshot(harness);
-		assert.equal(snapshot.budgetUsage.tokens, 1_000_000);
+		assert.equal(snapshot.budgetUsage.tokens, 17);
 		assert.equal(snapshot.budgetUsage.automaticTurns, 0);
-		assert.equal(snapshot.phase, "budget_exhausted");
+		assert.equal(snapshot.budgetLimits.maxTokens, null);
+		assert.equal(snapshot.phase, "active");
 	});
 
 	it("queues exactly one continuation when terminal output arrives before settlement", async () => {
@@ -596,8 +642,8 @@ describe("session lifecycle", () => {
 		await restored.start("resume");
 		assert.equal(latestSnapshot(restored).phase, "faulted");
 		assert.match(latestSnapshot(restored).faultReason ?? "", /delivery cannot be proven/u);
-		await restored.command("resume");
-		assert.match(restored.notifications.at(-1)?.message ?? "", /cannot resume|No live|current phase/u);
+		await assert.rejects(restored.command("resume"), /cannot resume|No live|current phase/u);
+		assert.deepEqual(restored.notifications, []);
 		assert.equal(restored.sentMessages.length, 0);
 	});
 
@@ -629,7 +675,7 @@ describe("session lifecycle", () => {
 			input: {},
 		});
 		assert.deepEqual(unblocked, [undefined]);
-		assert.match(forked.notifications.at(-1)?.message ?? "", /another session\/fork/u);
+		assert.deepEqual(forked.notifications, []);
 	});
 
 	it("persists only value-free coordination snapshots", async () => {
