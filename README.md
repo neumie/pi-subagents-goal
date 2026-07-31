@@ -21,18 +21,23 @@ The extension owns `/goal`, schedules continuation turns, tracks every delegated
 
 Detached work is intentionally unavailable. `pi-subagents` currently queues its own completion turn before publishing its observer event, so a downstream extension cannot be the sole continuation owner. See [`docs/UPSTREAM-INTEGRATION.md`](docs/UPSTREAM-INTEGRATION.md).
 
-## Installation for development
+## Installation
 
-Install `pi-subagents` separately, then load this checkout as a Pi extension:
+Install the audited [`pi-subagents`](https://github.com/neumie/pi-subagents) revision, then install this repository through Pi:
+
+```bash
+pi install git:github.com/neumie/pi-subagents@886bbad929134d7954a4fb34e532d82ac21e33e8
+pi install git:github.com/neumie/pi-subagents-goal
+```
+
+For development from a local checkout:
 
 ```bash
 npm ci --ignore-scripts --no-audit --no-fund
 pi -e /absolute/path/to/pi-subagents-goal/index.ts
 ```
 
-For persistent installation, add the repository as a Pi package using Pi's normal package configuration. Do not load another extension that owns `/goal` or any `goal_*` tool name; namespace conflicts fail closed at `session_start`.
-
-This repository is marked `private` and is not intended to be published by the delivery workflow.
+Do not load another extension that owns `/goal` or any `goal_*` tool name; namespace conflicts fail closed at `session_start`. The npm package remains marked `private` to prevent accidental registry publication; the Git repository is the supported distribution source.
 
 ## Usage
 

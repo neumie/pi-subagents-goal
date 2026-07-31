@@ -5,6 +5,10 @@
 	"type": "module",
 	"private": true,
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/neumie/pi-subagents-goal.git"
+	},
 	"keywords": [
 		"pi-package",
 		"pi-extension",
