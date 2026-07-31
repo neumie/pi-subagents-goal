@@ -1,6 +1,6 @@
 {
 	"name": "pi-subagents-goal",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Autonomous Pi goal loop with optional fail-closed pi-subagents coordination",
 	"type": "module",
 	"private": true,

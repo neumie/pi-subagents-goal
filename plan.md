@@ -32,7 +32,7 @@ The current local `pi-subagents` 0.38.1 cannot safely hand detached completion o
 
 Implemented and independently reviewed on the feature branch with:
 
-- 84 deterministic tests spanning direct-only goals, foreign-turn isolation, optional owned work, state, persistence, bridge, runner, status API, and extension behavior;
+- 86 deterministic tests spanning direct-only goals, custom-turn dispatch, foreign-turn isolation, optional owned work, state, persistence, bridge, runner, status API, and extension behavior;
 - warning-free Biome format/lint and strict TypeScript checks;
 - exact Pi 0.83.0 Jiti loader smoke;
 - clean local `pi-subagents` 0.38.1 smoke at commit `886bbad929134d7954a4fb34e532d82ac21e33e8`;

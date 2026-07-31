@@ -71,9 +71,13 @@ async function startGoal(harness: Harness, objective = "Complete safely"): Promi
 }
 
 async function markLatestGoalTurnRunning(harness: Harness): Promise<void> {
-	const prompt = String(harness.sentMessages.at(-1)?.message.content ?? "");
-	await harness.emit("before_agent_start", { type: "before_agent_start", prompt, systemPrompt: "BASE" });
+	const message = harness.sentMessages.at(-1)?.message;
+	assert.ok(message);
 	await harness.emit("agent_start", { type: "agent_start" });
+	await harness.emit("message_start", {
+		type: "message_start",
+		message: { role: "custom", ...message },
+	});
 }
 
 const markInitialTurnRunning = markLatestGoalTurnRunning;
@@ -408,6 +412,43 @@ describe("foreground goal flow", () => {
 });
 
 describe("continuation races", () => {
+	it("starts the exact custom continuation after an earlier foreign turn", async () => {
+		const harness = createHarness();
+		const owner = await startGoal(harness);
+		const continuationMessage = harness.sentMessages.at(-1)?.message;
+		assert.ok(continuationMessage);
+		assert.equal(latestSnapshot(harness).continuation?.status, "queued");
+
+		await harness.emit("agent_start", { type: "agent_start" });
+		await harness.emit("message_start", {
+			type: "message_start",
+			message: { role: "custom", customType: "subagent-notify", content: "foreign" },
+		});
+		await harness.emit("turn_end", {
+			type: "turn_end",
+			message: { usage: { output: 99 }, content: [{ type: "text", text: "foreign" }] },
+			toolResults: [],
+		});
+		assert.equal(latestSnapshot(harness).continuation?.status, "queued");
+		assert.equal(latestSnapshot(harness).budgetUsage.tokens, 0);
+
+		await harness.emit("message_start", {
+			type: "message_start",
+			message: { role: "custom", ...continuationMessage },
+		});
+		assert.equal(latestSnapshot(harness).continuation?.status, "running");
+
+		const result = details(
+			await harness.callTool("goal_subagent", {
+				goalId: owner.goalId,
+				epoch: owner.epoch,
+				agent: "reviewer",
+				task: "Return OWNED_OK without tools or edits.",
+			}),
+		);
+		assert.equal(result.itemIds.length, 1);
+	});
+
 	it("does not let an ordinary foreign turn consume a queued goal continuation", async () => {
 		const harness = createHarness();
 		await startGoal(harness);

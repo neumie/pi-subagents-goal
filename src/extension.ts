@@ -38,6 +38,7 @@ import {
 	isTerminalWorkState,
 	sha256,
 	type CompletionRequest,
+	type ContinuationTicket,
 	type GoalSnapshot,
 	type OwnerIdentity,
 } from "./state.ts";
@@ -213,6 +214,45 @@ function continuationNonceFromPrompt(prompt: unknown): string | undefined {
 	return nonce && nonce.length <= 256 ? nonce : undefined;
 }
 
+function exactContinuationMessageNonce(message: unknown, snapshot: GoalSnapshot): string | undefined {
+	if (
+		!isRecord(message) ||
+		message.role !== "custom" ||
+		message.customType !== GOAL_CONTINUATION_MESSAGE ||
+		!isRecord(message.details) ||
+		message.details.version !== 1 ||
+		!isRecord(message.details.owner) ||
+		!isRecord(message.details.ticket)
+	) {
+		return undefined;
+	}
+	const continuation = snapshot.continuation;
+	if (continuation?.status !== "queued") return undefined;
+	const owner = message.details.owner;
+	const ticket = message.details.ticket;
+	const expected = continuation.ticket;
+	if (
+		owner.sessionId !== snapshot.owner.sessionId ||
+		owner.sessionFile !== snapshot.owner.sessionFile ||
+		owner.lineageId !== snapshot.owner.lineageId ||
+		owner.goalId !== snapshot.owner.goalId ||
+		owner.epoch !== snapshot.owner.epoch ||
+		ticket.goalId !== expected.goalId ||
+		ticket.epoch !== expected.epoch ||
+		ticket.sequence !== expected.sequence ||
+		ticket.nonce !== expected.nonce ||
+		ticket.expectedWorkGeneration !== expected.expectedWorkGeneration ||
+		ticket.kind !== expected.kind ||
+		!Array.isArray(ticket.outputItemIds) ||
+		ticket.outputItemIds.length !== expected.outputItemIds.length ||
+		!ticket.outputItemIds.every((itemId, index) => itemId === expected.outputItemIds[index]) ||
+		continuationNonceFromPrompt(outputText(message.content)) !== expected.nonce
+	) {
+		return undefined;
+	}
+	return expected.nonce;
+}
+
 function agentEndContainsContinuation(messages: unknown[], expectedNonce: string): boolean {
 	return messages.some((rawMessage) => {
 		if (!isRecord(rawMessage) || rawMessage.role !== "custom" || !isRecord(rawMessage.details)) return false;
@@ -350,6 +390,17 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		}
 		return compatibility;
 	};
+	const sendContinuation = (content: string, owner: OwnerIdentity, ticket: ContinuationTicket) => {
+		pi.sendMessage(
+			{
+				customType: GOAL_CONTINUATION_MESSAGE,
+				content,
+				display: true,
+				details: { version: 1, owner, ticket },
+			},
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+	};
 	const dispatchContinuation = (
 		ctx: ExtensionContext,
 		suppliedTicket?: ReturnType<GoalMachine["reserveContinuation"]>,
@@ -419,19 +470,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		persist();
 		publishStatus(ctx);
 		try {
-			pi.sendMessage(
-				{
-					customType: GOAL_CONTINUATION_MESSAGE,
-					content: continuationContent,
-					display: true,
-					details: {
-						version: 1,
-						owner: snapshot.owner,
-						ticket,
-					},
-				},
-				{ triggerTurn: true, deliverAs: "followUp" },
-			);
+			sendContinuation(continuationContent, snapshot.owner, ticket);
 			return true;
 		} catch (error) {
 			machine.fault(
@@ -571,23 +610,19 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			try {
 				const snapshot = machine.snapshot;
 				pi.sendMessage(objectiveMessage(goalObjective, snapshot), { deliverAs: "followUp" });
-				pi.sendMessage(
-					{
-						customType: GOAL_CONTINUATION_MESSAGE,
-						content: [
-							`${CONTINUATION_NONCE_PREFIX}${initial.nonce}`,
-							`Begin working autonomously toward: ${goalObjective}`,
-							"",
-							"Exact identity for every goal_* call (do not search for it elsewhere):",
-							`- goalId: ${snapshot.owner.goalId}`,
-							`- epoch: ${snapshot.owner.epoch}`,
-							"Work directly with ordinary tools. pi-subagents, goal_subagent, and goal_review are optional.",
-							"If goal-owned work is used, acknowledge every surfaced output and resolve unsuccessful outcomes before goal_done. An empty consideredItemIds list is valid when no goal-owned work was launched.",
-						].join("\n"),
-						display: true,
-						details: { version: 1, owner: snapshot.owner, ticket: initial },
-					},
-					{ triggerTurn: true, deliverAs: "followUp" },
+				sendContinuation(
+					[
+						`${CONTINUATION_NONCE_PREFIX}${initial.nonce}`,
+						`Begin working autonomously toward: ${goalObjective}`,
+						"",
+						"Exact identity for every goal_* call (do not search for it elsewhere):",
+						`- goalId: ${snapshot.owner.goalId}`,
+						`- epoch: ${snapshot.owner.epoch}`,
+						"Work directly with ordinary tools. pi-subagents, goal_subagent, and goal_review are optional.",
+						"If goal-owned work is used, acknowledge every surfaced output and resolve unsuccessful outcomes before goal_done. An empty consideredItemIds list is valid when no goal-owned work was launched.",
+					].join("\n"),
+					snapshot.owner,
+					initial,
 				);
 			} catch (error) {
 				machine.fault(
@@ -826,6 +861,16 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			publishStatus(ctx);
 			dispatchContinuation(ctx);
 		}
+	});
+
+	pi.on("message_start", (event, ctx) => {
+		if (!machine || !objective || machine.snapshot.phase !== "active") return;
+		const nonce = exactContinuationMessageNonce(event.message, machine.snapshot);
+		if (!nonce || !machine.agentStarted(Date.now(), nonce)) return;
+		pendingContinuationNonce = undefined;
+		currentRunTracked = true;
+		persist();
+		publishStatus(ctx);
 	});
 
 	pi.on("before_agent_start", (event) => {

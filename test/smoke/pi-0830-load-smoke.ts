@@ -25,6 +25,7 @@ assert.deepEqual(
 		"agent_settled",
 		"agent_start",
 		"before_agent_start",
+		"message_start",
 		"session_before_compact",
 		"session_before_fork",
 		"session_before_switch",

@@ -328,14 +328,17 @@ export class GoalSubagentRunner {
 	}
 
 	#admit(item: PreparedWork): void {
-		this.#machine().admitWork({
-			itemId: item.itemId,
-			mode: item.mode,
-			role: item.role,
-			label: item.task.label ?? item.task.agent,
-			now: this.#now(),
-		});
-		this.#onStateChange();
+		try {
+			this.#machine().admitWork({
+				itemId: item.itemId,
+				mode: item.mode,
+				role: item.role,
+				label: item.task.label ?? item.task.agent,
+				now: this.#now(),
+			});
+		} finally {
+			this.#onStateChange();
+		}
 	}
 
 	async #execute(
