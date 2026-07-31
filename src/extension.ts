@@ -672,7 +672,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			if ((params.execution ?? "foreground") === "detached") {
 				throw new SubagentBridgeError(
 					installed.goalCoordination
-						? "Detached coordination was advertised, but Pi 0.82.1 still lacks the atomic continuation enqueue needed for the required exactly-once guarantee. Use foreground mode."
+						? "Detached coordination was advertised, but Pi 0.83.0 still lacks the atomic continuation enqueue needed for the required exactly-once guarantee. Use foreground mode."
 						: "Detached goal-owned work is unavailable: pi-subagents 0.38.1 does not advertise goalCoordination v1 and otherwise queues its own continuation before completion is observable. Use foreground mode.",
 				);
 			}
