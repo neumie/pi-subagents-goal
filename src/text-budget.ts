@@ -1,4 +1,6 @@
-export const MAX_MODEL_TEXT_BYTES = 48_000;
+import { GOAL_LIMITS } from "./limits.ts";
+
+export const MAX_MODEL_TEXT_BYTES = GOAL_LIMITS.maxModelPayloadBytes;
 
 export function utf8ByteLength(value: string): number {
 	return Buffer.byteLength(value, "utf8");

@@ -34,6 +34,10 @@ class FakeEvents implements EventBus {
 		this.emitted.push({ channel, data });
 		for (const handler of [...(this.#handlers.get(channel) ?? [])]) handler(data);
 	}
+
+	listenerCount(channel: string): number {
+		return this.#handlers.get(channel)?.size ?? 0;
+	}
 }
 
 function foregroundRequest(): ForegroundRequest {
@@ -161,6 +165,129 @@ describe("foreground delegation V2", () => {
 		bridge.dispose();
 	});
 
+	it("fails closed and removes every delegation listener for malformed started/update events", async () => {
+		const channels = [SUBAGENT_DELEGATION_STARTED, SUBAGENT_DELEGATION_UPDATE, SUBAGENT_DELEGATION_RESPONSE];
+		const assertClean = (events: FakeEvents) => {
+			for (const channel of channels)
+				assert.equal(events.listenerCount(channel), 0, `${channel} listener leaked`);
+		};
+		const cases: Array<{
+			channel: string;
+			make(request: Record<string, unknown>): unknown;
+			callbacks?: Parameters<SubagentBridge["runForeground"]>[2];
+		}> = [
+			{
+				channel: SUBAGENT_DELEGATION_STARTED,
+				make: (request) =>
+					Object.defineProperty(
+						{ version: 2, requestId: request.requestId, nodeId: request.nodeId },
+						"ownerRunId",
+						{
+							get: () => {
+								throw new Error("started getter");
+							},
+							enumerable: true,
+						},
+					),
+			},
+			{
+				channel: SUBAGENT_DELEGATION_UPDATE,
+				make: (request) =>
+					Object.defineProperty(
+						{
+							version: 2,
+							requestId: request.requestId,
+							ownerRunId: request.ownerRunId,
+							nodeId: request.nodeId,
+						},
+						"currentTool",
+						{
+							get: () => {
+								throw new Error("update getter");
+							},
+							enumerable: true,
+						},
+					),
+			},
+			{
+				channel: SUBAGENT_DELEGATION_STARTED,
+				make: (request) => {
+					const proxy = Proxy.revocable(
+						{
+							version: 2,
+							requestId: request.requestId,
+							ownerRunId: request.ownerRunId,
+							nodeId: request.nodeId,
+						},
+						{},
+					);
+					proxy.revoke();
+					return proxy.proxy;
+				},
+			},
+			{
+				channel: SUBAGENT_DELEGATION_UPDATE,
+				make: (request) => {
+					const proxy = Proxy.revocable(
+						{
+							version: 2,
+							requestId: request.requestId,
+							ownerRunId: request.ownerRunId,
+							nodeId: request.nodeId,
+						},
+						{},
+					);
+					proxy.revoke();
+					return proxy.proxy;
+				},
+			},
+		];
+		for (const testCase of cases) {
+			const events = new FakeEvents();
+			events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+				events.emit(testCase.channel, testCase.make(raw as Record<string, unknown>));
+			});
+			const bridge = new SubagentBridge(events);
+			await assert.rejects(() => bridge.runForeground(foregroundRequest(), undefined), SubagentBridgeError);
+			assertClean(events);
+		}
+		for (const [channel, callbacks] of [
+			[
+				SUBAGENT_DELEGATION_STARTED,
+				{
+					onStarted: () => {
+						throw new Error("started callback");
+					},
+				},
+			],
+			[
+				SUBAGENT_DELEGATION_UPDATE,
+				{
+					onUpdate: () => {
+						throw new Error("update callback");
+					},
+				},
+			],
+		] as const) {
+			const events = new FakeEvents();
+			events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+				const request = raw as Record<string, unknown>;
+				events.emit(channel, {
+					version: 2,
+					requestId: request.requestId,
+					ownerRunId: request.ownerRunId,
+					nodeId: request.nodeId,
+				});
+			});
+			const bridge = new SubagentBridge(events);
+			await assert.rejects(
+				() => bridge.runForeground(foregroundRequest(), undefined, callbacks),
+				/callback/u,
+			);
+			assertClean(events);
+		}
+	});
+
 	it("ignores stale responses with only a matching request ID", async () => {
 		const events = new FakeEvents();
 		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
@@ -259,6 +386,307 @@ describe("foreground delegation V2", () => {
 		});
 		const bridge = new SubagentBridge(events);
 		await assert.rejects(() => bridge.runForeground(foregroundRequest(), undefined), /unknown delegation/u);
+		bridge.dispose();
+	});
+
+	it("rejects malformed exact terminals but ignores foreign malformed tuples", async () => {
+		const events = new FakeEvents();
+		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+			const request = raw as Record<string, unknown>;
+			events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: "foreign",
+				nodeId: request.nodeId,
+				status: "future_status",
+			});
+			events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: request.ownerRunId,
+				nodeId: request.nodeId,
+				status: "completed",
+				result: { kind: "text", text: "x".repeat(1_000_001) },
+			});
+		});
+		const bridge = new SubagentBridge(events);
+		await assert.rejects(
+			() => bridge.runForeground(foregroundRequest(), undefined),
+			/Malformed foreground terminal text/u,
+		);
+		bridge.dispose();
+	});
+
+	it("rejects terminal, result, and usage accessors without invoking them and catches proxy descriptor failures", async () => {
+		for (const makeTerminal of [
+			(request: Record<string, unknown>) =>
+				Object.defineProperty(
+					{
+						version: 2,
+						requestId: request.requestId,
+						ownerRunId: request.ownerRunId,
+						nodeId: request.nodeId,
+					},
+					"status",
+					{
+						get: () => {
+							throw new Error("status getter invoked");
+						},
+						enumerable: true,
+					},
+				),
+			(request: Record<string, unknown>) => ({
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: request.ownerRunId,
+				nodeId: request.nodeId,
+				status: "completed",
+				result: Object.defineProperty({}, "kind", {
+					get: () => {
+						throw new Error("result getter invoked");
+					},
+					enumerable: true,
+				}),
+			}),
+			(request: Record<string, unknown>) => ({
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: request.ownerRunId,
+				nodeId: request.nodeId,
+				status: "failed",
+				usage: Object.defineProperty({}, "input", {
+					get: () => {
+						throw new Error("usage getter invoked");
+					},
+					enumerable: true,
+				}),
+			}),
+		] as const) {
+			const events = new FakeEvents();
+			events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+				const request = raw as Record<string, unknown>;
+				events.emit(SUBAGENT_DELEGATION_RESPONSE, makeTerminal(request));
+			});
+			const bridge = new SubagentBridge(events);
+			await assert.rejects(
+				() => bridge.runForeground(foregroundRequest(), undefined),
+				/Malformed foreground terminal/u,
+			);
+			bridge.dispose();
+		}
+		const events = new FakeEvents();
+		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+			const request = raw as Record<string, unknown>;
+			const target = {
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: request.ownerRunId,
+				nodeId: request.nodeId,
+				status: "failed",
+			};
+			events.emit(
+				SUBAGENT_DELEGATION_RESPONSE,
+				new Proxy(target, {
+					getOwnPropertyDescriptor: () => {
+						throw new Error("descriptor trap");
+					},
+				}),
+			);
+		});
+		const bridge = new SubagentBridge(events);
+		await assert.rejects(
+			() => bridge.runForeground(foregroundRequest(), undefined),
+			/Malformed foreground terminal/u,
+		);
+		bridge.dispose();
+	});
+
+	it("fails and cleans up when an exact V2 response is a revoked proxy", async () => {
+		const events = new FakeEvents();
+		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+			const request = raw as Record<string, unknown>;
+			const { proxy, revoke } = Proxy.revocable(
+				{
+					version: 2,
+					requestId: request.requestId,
+					ownerRunId: request.ownerRunId,
+					nodeId: request.nodeId,
+					status: "failed",
+				},
+				{},
+			);
+			revoke();
+			events.emit(SUBAGENT_DELEGATION_RESPONSE, proxy);
+		});
+		const bridge = new SubagentBridge(events);
+		await assert.rejects(() => bridge.runForeground(foregroundRequest(), undefined), SubagentBridgeError);
+		bridge.dispose();
+	});
+
+	it("copies structured JSON incrementally, preserves __proto__, and rejects oversized repeated strings", async () => {
+		const events = new FakeEvents();
+		let oversized = false;
+		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+			const request = raw as Record<string, unknown>;
+			const value = Object.create(null) as Record<string, unknown>;
+			Object.defineProperty(value, "__proto__", { value: "own-json-key", enumerable: true });
+			events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: request.ownerRunId,
+				nodeId: request.nodeId,
+				status: "completed",
+				result: {
+					kind: "structured",
+					value: oversized ? Array.from({ length: 20 }, () => "x".repeat(60_000)) : value,
+				},
+			});
+		});
+		const bridge = new SubagentBridge(events);
+		const request = { ...foregroundRequest(), result: { kind: "structured", schema: {} } as const };
+		const terminal = await bridge.runForeground(request, undefined);
+		assert.equal(
+			Object.getPrototypeOf(terminal.result?.kind === "structured" ? terminal.result.value : undefined),
+			null,
+		);
+		assert.equal(
+			Object.getOwnPropertyDescriptor(
+				(terminal.result as { value: Record<string, unknown> }).value,
+				"__proto__",
+			)?.value,
+			"own-json-key",
+		);
+		oversized = true;
+		await assert.rejects(() => bridge.runForeground(request, undefined), /UTF-8 limit/u);
+		bridge.dispose();
+	});
+
+	it("rejects a huge sparse proxy array before collecting descriptors or keys", async () => {
+		const events = new FakeEvents();
+		let ownKeysCalls = 0;
+		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+			const request = raw as Record<string, unknown>;
+			const sparse: unknown[] = [];
+			sparse.length = 10_001;
+			const value = new Proxy(sparse, {
+				ownKeys: (target) => {
+					ownKeysCalls += 1;
+					return Reflect.ownKeys(target);
+				},
+			});
+			events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: request.ownerRunId,
+				nodeId: request.nodeId,
+				status: "completed",
+				result: { kind: "structured", value },
+			});
+		});
+		const bridge = new SubagentBridge(events);
+		await assert.rejects(
+			() =>
+				bridge.runForeground(
+					{ ...foregroundRequest(), result: { kind: "structured", schema: {} } },
+					undefined,
+				),
+			/array length/u,
+		);
+		assert.equal(ownKeysCalls, 0);
+		bridge.dispose();
+	});
+
+	it("normalizes a zero-length proxy array with many named properties without key enumeration", async () => {
+		const events = new FakeEvents();
+		let ownKeysCalls = 0;
+		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+			const request = raw as Record<string, unknown>;
+			const array: unknown[] = [];
+			for (let index = 0; index <= 10_000; index += 1) {
+				Object.defineProperty(array, `named-${index}`, { value: index, enumerable: true });
+			}
+			const value = new Proxy(array, {
+				ownKeys: (target) => {
+					ownKeysCalls += 1;
+					return Reflect.ownKeys(target);
+				},
+			});
+			events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: request.ownerRunId,
+				nodeId: request.nodeId,
+				status: "completed",
+				result: { kind: "structured", value },
+			});
+		});
+		const bridge = new SubagentBridge(events);
+		const terminal = await bridge.runForeground(
+			{ ...foregroundRequest(), result: { kind: "structured", schema: {} } },
+			undefined,
+		);
+		assert.deepEqual((terminal.result as { value: unknown }).value, []);
+		assert.equal(ownKeysCalls, 0);
+		bridge.dispose();
+	});
+
+	it("accepts fractional cost and rejects bridge launch values beyond hard limits", async () => {
+		const events = new FakeEvents();
+		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+			const request = raw as Record<string, unknown>;
+			events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+				version: 2,
+				requestId: request.requestId,
+				ownerRunId: request.ownerRunId,
+				nodeId: request.nodeId,
+				status: "failed",
+				result: { kind: "text", text: "failed" },
+				usage: {
+					input: 1,
+					output: 2,
+					cacheRead: 0,
+					cacheWrite: 0,
+					cost: 0.25,
+					turns: 1,
+					toolCalls: 0,
+					durationMs: 2,
+				},
+			});
+		});
+		const bridge = new SubagentBridge(events);
+		assert.equal((await bridge.runForeground(foregroundRequest(), undefined)).usage?.cost, 0.25);
+		await assert.rejects(
+			() => bridge.runForeground({ ...foregroundRequest(), timeoutMs: 1_800_001 }, undefined),
+			/timeoutMs/u,
+		);
+		await assert.rejects(
+			() => bridge.runForeground({ ...foregroundRequest(), turnBudget: { maxTurns: 25 } }, undefined),
+			/turnBudget/u,
+		);
+		await bridge.runForeground({ ...foregroundRequest(), task: "x".repeat(260_000) }, undefined);
+		await assert.rejects(
+			() => bridge.runForeground({ ...foregroundRequest(), task: "x".repeat(260_001) }, undefined),
+			/task/u,
+		);
+		bridge.dispose();
+	});
+
+	it("uses requested timeout plus the fixed five-second protocol cleanup allowance", async () => {
+		const events = new FakeEvents();
+		const controller = new AbortController();
+		const delays: number[] = [];
+		events.on(SUBAGENT_DELEGATION_REQUEST, () => controller.abort());
+		const bridge = new SubagentBridge(events, {
+			setTimeout: (_handler, delayMs) => {
+				delays.push(delayMs);
+				return delayMs;
+			},
+			clearTimeout: () => undefined,
+		});
+		await assert.rejects(() =>
+			bridge.runForeground({ ...foregroundRequest(), timeoutMs: 1_800_000 }, controller.signal),
+		);
+		assert.deepEqual(delays, [1_805_000]);
 		bridge.dispose();
 	});
 

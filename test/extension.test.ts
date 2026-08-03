@@ -7,6 +7,7 @@ import {
 	type SessionEntryLike,
 } from "../src/persistence.ts";
 import { GOAL_STATUS_EVENT, GOAL_STATUS_REQUEST_EVENT, type GoalStatusEnvelope } from "../src/status-api.ts";
+import { boundedReviewText } from "../src/extension.ts";
 import {
 	SUBAGENT_DELEGATION_RESPONSE,
 	SUBAGENT_DELEGATION_STARTED,
@@ -103,6 +104,21 @@ function latestSnapshot(harness: Harness) {
 	return loaded.snapshot;
 }
 
+describe("bounded review rendering", () => {
+	it("reserves item framing and acknowledgement tokens while truncating multibyte evidence safely", () => {
+		const text = boundedReviewText({
+			verdict: "fail",
+			findings: [{ severity: "blocker", issue: "😀".repeat(20_000), rationale: "é".repeat(20_000) }],
+			itemId: "review-item",
+			ackToken: "review-token",
+		});
+		assert.ok(Buffer.byteLength(text, "utf8") <= 48_000);
+		assert.match(text, /Review item: review-item/u);
+		assert.match(text, /Acknowledgement token: review-token/u);
+		assert.equal(Buffer.from(text, "utf8").toString("utf8"), text);
+	});
+});
+
 describe("Pi extension registration and ownership", () => {
 	it("solely registers /goal and the five goal-owned tools", async () => {
 		const harness = createHarness();
@@ -151,6 +167,22 @@ describe("Pi extension registration and ownership", () => {
 		await assert.rejects(toolConflict.command("objective"), /namespace.*(?:active|conflict)/u);
 		assert.equal(toolConflict.sentMessages.length, 0);
 		assert.deepEqual(toolConflict.notifications, []);
+	});
+
+	it("recovers /goal and clears providerError after a later clean session_start", async () => {
+		const harness = createHarness({ preexistingGoalTool: "goal_done" });
+		const statuses: GoalStatusEnvelope[] = [];
+		harness.events.on(GOAL_STATUS_EVENT, (value) => statuses.push(value as GoalStatusEnvelope));
+		await harness.start();
+		assert.ok(statuses.at(-1)?.providerError);
+		await assert.rejects(harness.command("blocked"), /namespace/u);
+
+		harness.recoverManagedNamespace();
+		harness.replaceBranch();
+		await harness.start("resume");
+		assert.equal(statuses.at(-1)?.providerError, undefined);
+		await harness.command("recovered");
+		assert.equal(latestSnapshot(harness).phase, "active");
 	});
 
 	it("publishes session-scoped status without writing Pi UI", async () => {
@@ -280,6 +312,90 @@ describe("foreground goal flow", () => {
 		assert.deepEqual(directAfterCompletion, []);
 	});
 
+	it("serializes acknowledgement behind a started foreground sibling in FIFO order", async () => {
+		let held: Record<string, unknown> | undefined;
+		let started!: () => void;
+		const startedB = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const harness = createHarness({
+			provider: (request, events) => {
+				const requestId = request.requestId;
+				const ownerRunId = request.ownerRunId;
+				const nodeId = request.nodeId;
+				if (request.task === "B") {
+					held = request;
+					events.emit(SUBAGENT_DELEGATION_STARTED, {
+						version: SUBAGENT_DELEGATION_VERSION,
+						requestId,
+						ownerRunId,
+						nodeId,
+					});
+					started();
+					return;
+				}
+				events.emit(SUBAGENT_DELEGATION_STARTED, {
+					version: SUBAGENT_DELEGATION_VERSION,
+					requestId,
+					ownerRunId,
+					nodeId,
+				});
+				events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+					version: SUBAGENT_DELEGATION_VERSION,
+					requestId,
+					ownerRunId,
+					nodeId,
+					status: "completed",
+					result: { kind: "text", text: "A output" },
+				});
+			},
+		});
+		const owner = await startGoal(harness);
+		await markInitialTurnRunning(harness);
+		const a = details(
+			await harness.callTool("goal_subagent", {
+				goalId: owner.goalId,
+				epoch: owner.epoch,
+				agent: "worker",
+				task: "A",
+			}),
+		);
+		assert.equal(latestSnapshot(harness).work[0]?.outputState, "surfaced");
+		const bPromise = harness.callTool("goal_subagent", {
+			goalId: owner.goalId,
+			epoch: owner.epoch,
+			agent: "worker",
+			task: "B",
+		});
+		await startedB;
+		let acknowledged = false;
+		const ackPromise = harness
+			.callTool("goal_ack_output", {
+				goalId: owner.goalId,
+				epoch: owner.epoch,
+				items: [{ ...a.acknowledgements[0], consideration: "Considered A." }],
+			})
+			.then(() => {
+				acknowledged = true;
+			});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(acknowledged, false, "acknowledgement must wait behind B's serialized terminal mutation");
+		assert.ok(held);
+		harness.events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+			version: SUBAGENT_DELEGATION_VERSION,
+			requestId: held.requestId,
+			ownerRunId: held.ownerRunId,
+			nodeId: held.nodeId,
+			status: "completed",
+			result: { kind: "text", text: "B output" },
+		});
+		await Promise.all([bPromise, ackPromise]);
+		const snapshot = latestSnapshot(harness);
+		assert.equal(snapshot.work[0]?.outputState, "consumed");
+		assert.equal(snapshot.work[1]?.state, "succeeded");
+		assert.equal(snapshot.work[1]?.outputState, "surfaced");
+	});
+
 	it("applies batched output acknowledgements atomically", async () => {
 		const harness = createHarness();
 		const owner = await startGoal(harness);
@@ -315,6 +431,32 @@ describe("foreground goal flow", () => {
 			latestSnapshot(harness).work.map((item) => item.outputState),
 			["consumed", "consumed"],
 		);
+	});
+
+	it("never sends a continuation when pause, rejected busy resume, and cancel race a delayed child response", async () => {
+		let pending: Record<string, unknown> | undefined;
+		const harness = createHarness({
+			provider: (request) => {
+				pending = request;
+			},
+		});
+		const owner = await startGoal(harness);
+		await markInitialTurnRunning(harness);
+		const work = harness.callTool("goal_subagent", {
+			goalId: owner.goalId,
+			epoch: owner.epoch,
+			agent: "worker",
+			task: "delay cancellation",
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.ok(pending);
+		await harness.command("pause");
+		await assert.rejects(harness.command("resume"), /Wait for Pi to settle/u);
+		await harness.command("cancel");
+		await work;
+		await harness.settle();
+		assert.equal(latestSnapshot(harness).phase, "cancelled");
+		assert.equal(harness.sentMessages.length, 2, "cancelled work must not enqueue a goal followUp");
 	});
 
 	it("persists an in-flight child cancellation as an explicit terminal goal", async () => {
@@ -381,6 +523,65 @@ describe("foreground goal flow", () => {
 		assert.equal(harness.rpcRequestCount(), 0);
 	});
 
+	it("fails hostile multibyte review evidence without losing its exact acknowledgement token", async () => {
+		const harness = createHarness({
+			provider: (request, events) => {
+				events.emit(SUBAGENT_DELEGATION_STARTED, {
+					version: SUBAGENT_DELEGATION_VERSION,
+					requestId: request.requestId,
+					ownerRunId: request.ownerRunId,
+					nodeId: request.nodeId,
+				});
+				events.emit(SUBAGENT_DELEGATION_RESPONSE, {
+					version: SUBAGENT_DELEGATION_VERSION,
+					requestId: request.requestId,
+					ownerRunId: request.ownerRunId,
+					nodeId: request.nodeId,
+					status: "completed",
+					result: {
+						kind: "structured",
+						value: {
+							verdict: "pass",
+							findings: Array.from({ length: 6 }, () => ({
+								severity: "blocker",
+								issue: "😀".repeat(2_000),
+								rationale: "😀".repeat(2_000),
+							})),
+						},
+					},
+				});
+			},
+		});
+		const owner = await startGoal(harness);
+		await markInitialTurnRunning(harness);
+		const reviewTool = await harness.callTool(
+			"goal_review",
+			{ goalId: owner.goalId, epoch: owner.epoch },
+			"hostile-review",
+		);
+		const review = details(reviewTool);
+		const token = review.acknowledgements[0]?.ackToken;
+		const reviewText = reviewTool.content[0]?.text ?? "";
+		assert.equal(review.verdict, "fail");
+		assert.ok(token);
+		assert.ok(Buffer.byteLength(reviewText, "utf8") <= 48_000);
+		assert.ok(reviewText.includes(token));
+		const snapshot = latestSnapshot(harness);
+		assert.equal(snapshot.review?.verdict, "fail");
+		const rendered = String(
+			(
+				await harness.callTool("goal_ack_output", {
+					goalId: owner.goalId,
+					epoch: owner.epoch,
+					items: [
+						{ itemId: review.itemIds[0], ackToken: token, consideration: "Hostile review considered." },
+					],
+				})
+			).content[0]?.text,
+		);
+		assert.match(rendered, /Acknowledged 1/u);
+	});
+
 	it("keeps an optional review advisory after later ordinary work", async () => {
 		const harness = createHarness();
 		const owner = await startGoal(harness);
@@ -411,7 +612,33 @@ describe("foreground goal flow", () => {
 	});
 });
 
-describe("continuation races", () => {
+describe("continuation delivery and completion races", () => {
+	it("rejects a foreign goal_done before the queued continuation message starts", async () => {
+		const harness = createHarness();
+		const owner = await startGoal(harness);
+		await assert.rejects(
+			() =>
+				harness.callTool("goal_done", {
+					goalId: owner.goalId,
+					epoch: owner.epoch,
+					summary: "foreign",
+					consideredItemIds: [],
+				}),
+			/reserved or queued/u,
+		);
+		assert.equal(latestSnapshot(harness).phase, "active");
+	});
+
+	it("faults once when a void sendMessage delivery is dropped without throwing", async () => {
+		const harness = createHarness();
+		await startGoal(harness);
+		await harness.emit("agent_settled", { type: "agent_settled" });
+		const snapshot = latestSnapshot(harness);
+		assert.equal(snapshot.phase, "faulted");
+		assert.match(snapshot.faultReason ?? "", /unobserved/u);
+		assert.equal(harness.sentMessages.length, 2);
+	});
+
 	it("starts the exact custom continuation after an earlier foreign turn", async () => {
 		const harness = createHarness();
 		const owner = await startGoal(harness);
@@ -449,7 +676,17 @@ describe("continuation races", () => {
 		assert.equal(result.itemIds.length, 1);
 	});
 
-	it("does not let an ordinary foreign turn consume a queued goal continuation", async () => {
+	it("permits an empty agent_end only after locally observing the exact continuation message", async () => {
+		const harness = createHarness();
+		await startGoal(harness);
+		await markInitialTurnRunning(harness);
+		await harness.emit("agent_end", { type: "agent_end", messages: [] });
+		assert.notEqual(latestSnapshot(harness).phase, "faulted");
+		await harness.emit("agent_settled", { type: "agent_settled" });
+		assert.notEqual(latestSnapshot(harness).phase, "faulted");
+	});
+
+	it("faults rather than treating an ordinary foreign settlement as delivery of a queued continuation", async () => {
 		const harness = createHarness();
 		await startGoal(harness);
 		const queued = latestSnapshot(harness).continuation;
@@ -474,13 +711,10 @@ describe("continuation races", () => {
 		await harness.emit("agent_settled", { type: "agent_settled" });
 
 		const afterForeign = latestSnapshot(harness);
-		assert.equal(afterForeign.phase, "active");
-		assert.equal(afterForeign.continuation?.status, "queued");
+		assert.equal(afterForeign.phase, "faulted");
+		assert.match(afterForeign.faultReason ?? "", /unobserved/u);
 		assert.equal(afterForeign.budgetUsage.tokens, 0);
 		assert.equal(harness.sentMessages.length, 2);
-
-		await markLatestGoalTurnRunning(harness);
-		assert.equal(latestSnapshot(harness).continuation?.status, "running");
 	});
 
 	it("counts only new parent output and leaves the token cap disabled", async () => {
@@ -605,6 +839,9 @@ describe("continuation races", () => {
 			result: { kind: "text", text: `late-output:${"😀".repeat(20_000)}` },
 		});
 		const work = details(await workPromise);
+		assert.equal(harness.sentMessages.length, 2, "busy tool completion leaves a reserved continuation");
+		assert.equal(latestSnapshot(harness).continuation?.status, "reserved");
+		await harness.settle();
 		assert.equal(harness.sentMessages.length, 3);
 		const continuationContent = String(harness.sentMessages[2]?.message.content);
 		assert.match(continuationContent, /late-output/u);
@@ -615,8 +852,6 @@ describe("continuation races", () => {
 				work.acknowledgements[0]?.ackToken ?? "missing",
 			),
 		);
-		await harness.settle();
-		assert.equal(harness.sentMessages.length, 3);
 	});
 });
 
@@ -646,6 +881,21 @@ describe("session lifecycle", () => {
 		assert.deepEqual(await harness.emit("session_before_compact", { type: "session_before_compact" }), [
 			{ cancel: true },
 		]);
+	});
+
+	it("clears delivery nonces on pause, cancel, and shutdown so stale settlements cannot fault recovery", async () => {
+		for (const action of ["pause", "cancel", "shutdown"] as const) {
+			const harness = createHarness();
+			await startGoal(harness);
+			if (action === "shutdown") {
+				await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+			} else {
+				await harness.command(action);
+			}
+			await harness.emit("agent_settled", { type: "agent_settled" });
+			const snapshot = latestSnapshot(harness);
+			assert.notEqual(snapshot.phase, "faulted", `${action} left a stale delivery nonce`);
+		}
 	});
 
 	it("fails closed when restore cannot prove whether a queued continuation was delivered", async () => {

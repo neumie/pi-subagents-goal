@@ -10,6 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { GoalSubagentRunner, type GoalSubagentParams } from "./foreground-runner.ts";
+import { GOAL_LIMITS } from "./limits.ts";
 import {
 	GOAL_CONTINUATION_MESSAGE,
 	GOAL_OBJECTIVE_MESSAGE,
@@ -69,8 +70,8 @@ const TaskSchema = Type.Object(
 
 const TurnBudgetSchema = Type.Object(
 	{
-		maxTurns: Type.Integer({ minimum: 1, maximum: 10_000 }),
-		graceTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000 })),
+		maxTurns: Type.Integer({ minimum: 1, maximum: GOAL_LIMITS.maxTurns }),
+		graceTurns: Type.Optional(Type.Integer({ minimum: 0, maximum: GOAL_LIMITS.hardGraceTurns })),
 	},
 	{ additionalProperties: false },
 );
@@ -81,12 +82,12 @@ const GoalSubagentSchema = Type.Object(
 		epoch: Type.Integer({ minimum: 1 }),
 		execution: Type.Optional(StringEnum(["foreground", "detached"] as const)),
 		agent: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
-		task: Type.Optional(Type.String({ minLength: 1, maxLength: 100_000 })),
-		tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 8 })),
-		chain: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 8 })),
+		task: Type.Optional(Type.String({ minLength: 1, maxLength: GOAL_LIMITS.maxTaskBytes })),
+		tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: GOAL_LIMITS.maxGroupItems })),
+		chain: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: GOAL_LIMITS.maxGroupItems })),
 		context: Type.Optional(StringEnum(["fresh", "fork"] as const)),
-		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
-		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_147_483_647 })),
+		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: GOAL_LIMITS.maxParallelConcurrency })),
+		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: GOAL_LIMITS.hardChildTimeoutMs })),
 		turnBudget: Type.Optional(TurnBudgetSchema),
 	},
 	{ additionalProperties: false },
@@ -127,7 +128,7 @@ const GoalReviewSchema = Type.Object(
 		epoch: Type.Integer({ minimum: 1 }),
 		focus: Type.Optional(Type.String({ maxLength: 4_000 })),
 		agent: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
-		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_147_483_647 })),
+		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: GOAL_LIMITS.hardChildTimeoutMs })),
 	},
 	{ additionalProperties: false },
 );
@@ -287,6 +288,28 @@ function completionError(blockers: string[]): GoalInvariantError {
 	return new GoalInvariantError(`goal_done is blocked:\n- ${blockers.join("\n- ")}`);
 }
 
+export function boundedReviewText(input: {
+	verdict: "pass" | "fail";
+	findings: unknown[];
+	itemId: string;
+	ackToken: string;
+}): string {
+	const prefix = `Independent review verdict: ${input.verdict}\n\n`;
+	const suffix = `\n\nReview item: ${input.itemId}\n\nAcknowledgement token: ${input.ackToken}`;
+	const rawFindings = JSON.stringify(input.findings, null, 2);
+	const marker = "\n[Review evidence truncated by pi-subagents-goal.]";
+	const available = MAX_MODEL_TEXT_BYTES - utf8ByteLength(prefix) - utf8ByteLength(suffix);
+	if (available < utf8ByteLength(marker)) {
+		throw new GoalInvariantError("Review framing exceeds the model payload budget.");
+	}
+	const truncated = truncateUtf8(rawFindings, available - utf8ByteLength(marker));
+	const text = `${prefix}${truncated.text}${truncated.truncated ? marker : ""}${suffix}`;
+	if (utf8ByteLength(text) > MAX_MODEL_TEXT_BYTES) {
+		throw new GoalInvariantError("Bounded review payload exceeded its UTF-8 safety budget.");
+	}
+	return text;
+}
+
 function assertGoalIdentity(machine: GoalMachine, goalId: string, epoch: number): void {
 	const owner = machine.snapshot.owner;
 	if (owner.goalId !== goalId || owner.epoch !== epoch) {
@@ -325,6 +348,24 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	let runtimeEpoch = 0;
 	let pendingContinuationNonce: string | undefined;
 	let currentRunTracked = false;
+	let runningContinuationObserved = false;
+	const expectedContinuationNonces = new Set<string>();
+	let goalToolTail: Promise<void> = Promise.resolve();
+
+	// Deliberately extension-local: Pi's sequential execution mode would also serialize ordinary tools.
+	const serializeGoalTool = async <T>(operation: () => Promise<T>): Promise<T> => {
+		const previous = goalToolTail.catch(() => undefined);
+		let release!: () => void;
+		goalToolTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await operation();
+		} finally {
+			release();
+		}
+	};
 
 	const assertNamespace = () => {
 		if (namespaceFault) throw new GoalInvariantError(namespaceFault);
@@ -406,8 +447,18 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		suppliedTicket?: ReturnType<GoalMachine["reserveContinuation"]>,
 	) => {
 		if (!machine || !objective || machine.snapshot.phase !== "active") return false;
-		const ticket = suppliedTicket ?? machine.reserveContinuation(Date.now());
+		const ticket =
+			suppliedTicket ??
+			(machine.snapshot.continuation?.status === "reserved"
+				? machine.snapshot.continuation.ticket
+				: machine.reserveContinuation(Date.now()));
 		if (!ticket) {
+			persist();
+			publishStatus(ctx);
+			return false;
+		}
+		// Pi may still be processing a tool result or abort. Keep the durable reservation until idle settlement.
+		if (!ctx.isIdle()) {
 			persist();
 			publishStatus(ctx);
 			return false;
@@ -469,10 +520,12 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		}
 		persist();
 		publishStatus(ctx);
+		expectedContinuationNonces.add(ticket.nonce);
 		try {
 			sendContinuation(continuationContent, snapshot.owner, ticket);
 			return true;
 		} catch (error) {
+			expectedContinuationNonces.delete(ticket.nonce);
 			machine.fault(
 				`Pi rejected continuation ${ticket.sequence}; it will not be retried automatically: ${error instanceof Error ? error.message : String(error)}`,
 				Date.now(),
@@ -496,9 +549,12 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 
 	const restore = (event: SessionStartEvent, ctx: ExtensionContext) => {
 		currentCtx = ctx;
+		namespaceFault = undefined;
 		runtimeEpoch += 1;
 		pendingContinuationNonce = undefined;
 		currentRunTracked = false;
+		runningContinuationObserved = false;
+		expectedContinuationNonces.clear();
 		outputCache.clear();
 		compatibility = undefined;
 		compatibilitySessionId = undefined;
@@ -571,12 +627,14 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 				const active = requireMachine(ctx);
 				if (!active.pause("Paused explicitly by the user.", Date.now()))
 					throw new GoalInvariantError("Goal cannot be paused from its current phase.");
+				expectedContinuationNonces.clear();
 				persist();
 				if (!ctx.isIdle()) ctx.abort();
 				publishStatus(ctx);
 				return;
 			}
 			if (command === "resume") {
+				if (!ctx.isIdle()) throw new GoalInvariantError("Wait for Pi to settle before resuming /goal.");
 				const active = requireMachine(ctx);
 				if (!active.resume(Date.now()))
 					throw new GoalInvariantError("Goal cannot resume while work is active or the phase is not paused.");
@@ -588,6 +646,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			if (command === "cancel" || command === "clear") {
 				const active = requireMachine(ctx);
 				active.cancel(Date.now());
+				expectedContinuationNonces.clear();
 				persist();
 				if (!ctx.isIdle()) ctx.abort();
 				publishStatus(ctx);
@@ -607,6 +666,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			objective = goalObjective;
 			const initial = machine.queueInitialContinuation(Date.now());
 			persist();
+			expectedContinuationNonces.add(initial.nonce);
 			try {
 				const snapshot = machine.snapshot;
 				pi.sendMessage(objectiveMessage(goalObjective, snapshot), { deliverAs: "followUp" });
@@ -625,6 +685,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 					initial,
 				);
 			} catch (error) {
+				expectedContinuationNonces.delete(initial.nonce);
 				machine.fault(
 					`Initial goal turn could not be queued: ${error instanceof Error ? error.message : String(error)}`,
 					Date.now(),
@@ -651,28 +712,30 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		],
 		parameters: GoalSubagentSchema,
 		async execute(_toolCallId, params: GoalSubagentInput, signal, _onUpdate, ctx) {
-			const active = requireMachine(ctx);
-			assertGoalIdentity(active, params.goalId, params.epoch);
-			const installed = await ensureCompatibility(ctx);
-			if ((params.execution ?? "foreground") === "detached") {
-				throw new SubagentBridgeError(
-					installed.goalCoordination
-						? "Detached coordination was advertised, but Pi 0.83.0 still lacks the atomic continuation enqueue needed for the required exactly-once guarantee. Use foreground mode."
-						: "Detached goal-owned work is unavailable: pi-subagents 0.38.1 does not advertise goalCoordination v1 and otherwise queues its own continuation before completion is observable. Use foreground mode.",
-				);
-			}
-			const runParams: GoalSubagentParams = {
-				...(params.agent !== undefined ? { agent: params.agent } : {}),
-				...(params.task !== undefined ? { task: params.task } : {}),
-				...(params.tasks !== undefined ? { tasks: params.tasks } : {}),
-				...(params.chain !== undefined ? { chain: params.chain } : {}),
-				...(params.context !== undefined ? { context: params.context } : {}),
-				...(params.concurrency !== undefined ? { concurrency: params.concurrency } : {}),
-				...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
-				...(params.turnBudget !== undefined ? { turnBudget: params.turnBudget } : {}),
-			};
-			const result = await runner().run(runParams, signal, ctx.cwd);
-			return { content: [{ type: "text", text: result.text }], details: result.details };
+			return serializeGoalTool(async () => {
+				const active = requireMachine(ctx);
+				assertGoalIdentity(active, params.goalId, params.epoch);
+				const installed = await ensureCompatibility(ctx);
+				if ((params.execution ?? "foreground") === "detached") {
+					throw new SubagentBridgeError(
+						installed.goalCoordination
+							? "Detached coordination was advertised, but Pi 0.83.0 still lacks the atomic continuation enqueue needed for the required exactly-once guarantee. Use foreground mode."
+							: "Detached goal-owned work is unavailable: pi-subagents 0.38.1 does not advertise goalCoordination v1 and otherwise queues its own continuation before completion is observable. Use foreground mode.",
+					);
+				}
+				const runParams: GoalSubagentParams = {
+					...(params.agent !== undefined ? { agent: params.agent } : {}),
+					...(params.task !== undefined ? { task: params.task } : {}),
+					...(params.tasks !== undefined ? { tasks: params.tasks } : {}),
+					...(params.chain !== undefined ? { chain: params.chain } : {}),
+					...(params.context !== undefined ? { context: params.context } : {}),
+					...(params.concurrency !== undefined ? { concurrency: params.concurrency } : {}),
+					...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+					...(params.turnBudget !== undefined ? { turnBudget: params.turnBudget } : {}),
+				};
+				const result = await runner().run(runParams, signal, ctx.cwd);
+				return { content: [{ type: "text", text: result.text }], details: result.details };
+			});
 		},
 	});
 
@@ -685,32 +748,34 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		],
 		parameters: GoalAckSchema,
 		async execute(_toolCallId, params: GoalAckInput, _signal, _onUpdate, ctx) {
-			const active = requireMachine(ctx);
-			assertGoalIdentity(active, params.goalId, params.epoch);
-			const candidate = new GoalMachine(active.snapshot);
-			for (const item of params.items) {
-				if (
-					!candidate.acknowledgeOutput({
-						owner: candidate.snapshot.owner,
-						itemId: item.itemId,
-						ackToken: item.ackToken,
-						consideration: item.consideration,
-						now: Date.now(),
-					})
-				) {
-					throw new GoalInvariantError(`Output acknowledgement was rejected for ${item.itemId}.`);
+			return serializeGoalTool(async () => {
+				const active = requireMachine(ctx);
+				assertGoalIdentity(active, params.goalId, params.epoch);
+				const candidate = new GoalMachine(active.snapshot);
+				for (const item of params.items) {
+					if (
+						!candidate.acknowledgeOutput({
+							owner: candidate.snapshot.owner,
+							itemId: item.itemId,
+							ackToken: item.ackToken,
+							consideration: item.consideration,
+							now: Date.now(),
+						})
+					) {
+						throw new GoalInvariantError(`Output acknowledgement was rejected for ${item.itemId}.`);
+					}
 				}
-			}
-			machine = candidate;
-			persist();
-			publishStatus(ctx);
-			return {
-				content: [{ type: "text", text: `Acknowledged ${params.items.length} goal-owned output item(s).` }],
-				details: {
-					version: GOAL_TOOL_DETAILS_VERSION,
-					itemIds: params.items.map((item) => item.itemId),
-				},
-			};
+				machine = candidate;
+				persist();
+				publishStatus(ctx);
+				return {
+					content: [{ type: "text", text: `Acknowledged ${params.items.length} goal-owned output item(s).` }],
+					details: {
+						version: GOAL_TOOL_DETAILS_VERSION,
+						itemIds: params.items.map((item) => item.itemId),
+					},
+				};
+			});
 		},
 	});
 
@@ -721,31 +786,33 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			"Explicitly resolve an acknowledged unsuccessful child outcome; never converts it into success evidence.",
 		parameters: GoalResolveSchema,
 		async execute(_toolCallId, params: GoalResolveInput, _signal, _onUpdate, ctx) {
-			const active = requireMachine(ctx);
-			assertGoalIdentity(active, params.goalId, params.epoch);
-			if (
-				!active.resolveUnsuccessfulWork({
-					owner: active.snapshot.owner,
-					itemId: params.itemId,
-					rationale: params.rationale,
-					now: Date.now(),
-				})
-			) {
-				throw new GoalInvariantError(
-					"Only consumed, terminal, unsuccessful work can be explicitly resolved.",
-				);
-			}
-			persist();
-			publishStatus(ctx);
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Recorded explicit resolution for ${params.itemId}; its unsuccessful outcome remains in the ledger.`,
-					},
-				],
-				details: { version: GOAL_TOOL_DETAILS_VERSION, itemId: params.itemId },
-			};
+			return serializeGoalTool(async () => {
+				const active = requireMachine(ctx);
+				assertGoalIdentity(active, params.goalId, params.epoch);
+				if (
+					!active.resolveUnsuccessfulWork({
+						owner: active.snapshot.owner,
+						itemId: params.itemId,
+						rationale: params.rationale,
+						now: Date.now(),
+					})
+				) {
+					throw new GoalInvariantError(
+						"Only consumed, terminal, unsuccessful work can be explicitly resolved.",
+					);
+				}
+				persist();
+				publishStatus(ctx);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Recorded explicit resolution for ${params.itemId}; its unsuccessful outcome remains in the ledger.`,
+						},
+					],
+					details: { version: GOAL_TOOL_DETAILS_VERSION, itemId: params.itemId },
+				};
+			});
 		},
 	});
 
@@ -761,45 +828,47 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		],
 		parameters: GoalReviewSchema,
 		async execute(_toolCallId, params: GoalReviewInput, signal, _onUpdate, ctx) {
-			const active = requireMachine(ctx);
-			assertGoalIdentity(active, params.goalId, params.epoch);
-			await ensureCompatibility(ctx);
-			if (!objective) throw new GoalInvariantError("The active goal objective is unavailable.");
-			const review = await runner().review({
-				focus:
-					params.focus ??
-					"Correctness, deterministic races, Pi compatibility, test adequacy, and unresolved blockers.",
-				objective,
-				signal,
-				cwd: ctx.cwd,
-				...(params.agent !== undefined ? { agent: params.agent } : {}),
-				...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+			return serializeGoalTool(async () => {
+				const active = requireMachine(ctx);
+				assertGoalIdentity(active, params.goalId, params.epoch);
+				await ensureCompatibility(ctx);
+				if (!objective) throw new GoalInvariantError("The active goal objective is unavailable.");
+				const review = await runner().review({
+					focus:
+						params.focus ??
+						"Correctness, deterministic races, Pi compatibility, test adequacy, and unresolved blockers.",
+					objective,
+					signal,
+					cwd: ctx.cwd,
+					...(params.agent !== undefined ? { agent: params.agent } : {}),
+					...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+				});
+				const findings = boundedReviewText({
+					verdict: review.verdict,
+					findings: review.findings,
+					itemId: review.itemId,
+					ackToken: review.ackToken,
+				});
+				const owner = active.snapshot.owner;
+				const details: GoalToolDetails = {
+					version: GOAL_TOOL_DETAILS_VERSION,
+					goalId: owner.goalId,
+					epoch: owner.epoch,
+					lineageId: owner.lineageId,
+					itemIds: [review.itemId],
+					acknowledgements: [{ itemId: review.itemId, ackToken: review.ackToken }],
+					verdict: review.verdict,
+				};
+				return {
+					content: [
+						{
+							type: "text",
+							text: findings,
+						},
+					],
+					details,
+				};
 			});
-			const findings = JSON.stringify(review.findings, null, 2).slice(0, 30_000);
-			const owner = active.snapshot.owner;
-			const details: GoalToolDetails = {
-				version: GOAL_TOOL_DETAILS_VERSION,
-				goalId: owner.goalId,
-				epoch: owner.epoch,
-				lineageId: owner.lineageId,
-				itemIds: [review.itemId],
-				acknowledgements: [{ itemId: review.itemId, ackToken: review.ackToken }],
-				verdict: review.verdict,
-			};
-			return {
-				content: [
-					{
-						type: "text",
-						text: [
-							`Independent review verdict: ${review.verdict}`,
-							findings,
-							`Review item: ${review.itemId}`,
-							`Acknowledgement token: ${review.ackToken}`,
-						].join("\n\n"),
-					},
-				],
-				details,
-			};
 		},
 	});
 
@@ -814,27 +883,29 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		],
 		parameters: GoalDoneSchema,
 		async execute(_toolCallId, params: GoalDoneInput, _signal, _onUpdate, ctx) {
-			const active = requireMachine(ctx);
-			assertGoalIdentity(active, params.goalId, params.epoch);
-			const request: CompletionRequest = {
-				owner: active.snapshot.owner,
-				consideredItemIds: params.consideredItemIds,
-				now: Date.now(),
-			};
-			const decision = active.complete(request);
-			if (!decision.ok) throw completionError(decision.blockers);
-			persist();
-			publishStatus(ctx);
-			return {
-				content: [{ type: "text", text: `Goal complete.\n\n${params.summary}` }],
-				details: {
-					version: GOAL_TOOL_DETAILS_VERSION,
-					goalId: params.goalId,
-					epoch: params.epoch,
-					status: "completed",
-				},
-				terminate: true,
-			};
+			return serializeGoalTool(async () => {
+				const active = requireMachine(ctx);
+				assertGoalIdentity(active, params.goalId, params.epoch);
+				const request: CompletionRequest = {
+					owner: active.snapshot.owner,
+					consideredItemIds: params.consideredItemIds,
+					now: Date.now(),
+				};
+				const decision = active.complete(request);
+				if (!decision.ok) throw completionError(decision.blockers);
+				persist();
+				publishStatus(ctx);
+				return {
+					content: [{ type: "text", text: `Goal complete.\n\n${params.summary}` }],
+					details: {
+						version: GOAL_TOOL_DETAILS_VERSION,
+						goalId: params.goalId,
+						epoch: params.epoch,
+						status: "completed",
+					},
+					terminate: true,
+				};
+			});
 		},
 	});
 
@@ -866,9 +937,12 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	pi.on("message_start", (event, ctx) => {
 		if (!machine || !objective || machine.snapshot.phase !== "active") return;
 		const nonce = exactContinuationMessageNonce(event.message, machine.snapshot);
-		if (!nonce || !machine.agentStarted(Date.now(), nonce)) return;
+		if (!nonce) return;
+		expectedContinuationNonces.delete(nonce);
+		if (!machine.agentStarted(Date.now(), nonce)) return;
 		pendingContinuationNonce = undefined;
 		currentRunTracked = true;
+		runningContinuationObserved = true;
 		persist();
 		publishStatus(ctx);
 	});
@@ -880,6 +954,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		if (continuation?.status === "queued" && pendingContinuationNonce !== continuation.ticket.nonce) {
 			return;
 		}
+		if (continuation?.status === "queued" && pendingContinuationNonce === continuation.ticket.nonce) {
+			expectedContinuationNonces.delete(continuation.ticket.nonce);
+		}
 		return { systemPrompt: `${event.systemPrompt}\n\n${extensionSystemPrompt(objective, machine.snapshot)}` };
 	});
 
@@ -887,6 +964,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		if (!machine) {
 			pendingContinuationNonce = undefined;
 			currentRunTracked = false;
+			runningContinuationObserved = false;
 			return;
 		}
 		const before = machine.snapshot;
@@ -906,8 +984,11 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		const snapshot = machine.snapshot;
 		if (snapshot.currentRunEndObserved) return;
 		const continuation = snapshot.continuation;
+		// Pi can emit an empty agent_end for a custom-trigger turn. Only the exact locally observed
+		// continuation message_start authorizes that empty-message fallback; nonempty ends still re-check identity.
 		if (
 			continuation?.status === "running" &&
+			(!runningContinuationObserved || event.messages.length > 0) &&
 			!agentEndContainsContinuation(event.messages, continuation.ticket.nonce)
 		) {
 			machine.fault(
@@ -936,9 +1017,28 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
-		if (!machine || !currentRunTracked) return;
+		// Check before any early return or newly-dispatched ticket: Pi sendMessage is void.
+		const queuedNonce =
+			machine?.snapshot.continuation?.status === "queued"
+				? machine.snapshot.continuation.ticket.nonce
+				: undefined;
+		if (machine && queuedNonce && expectedContinuationNonces.has(queuedNonce)) {
+			expectedContinuationNonces.delete(queuedNonce);
+			machine.fault(
+				"Pi did not start a queued continuation before settlement; delivery is unobserved and will not be retried.",
+				Date.now(),
+			);
+			persist();
+			publishStatus(ctx);
+			return;
+		}
+		if (!machine || !currentRunTracked) {
+			if (machine?.snapshot.continuation?.status === "reserved" && ctx.isIdle()) dispatchContinuation(ctx);
+			return;
+		}
 		const ticket = machine.agentSettled(Date.now());
 		currentRunTracked = false;
+		runningContinuationObserved = false;
 		persist();
 		publishStatus(ctx);
 		if (ticket) dispatchContinuation(ctx, ticket);
@@ -986,7 +1086,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			compatibility = undefined;
 			compatibilitySessionId = undefined;
 			pendingContinuationNonce = undefined;
+			expectedContinuationNonces.clear();
 			currentRunTracked = false;
+			runningContinuationObserved = false;
 			currentCtx = undefined;
 			latestStatus = undefined;
 		}

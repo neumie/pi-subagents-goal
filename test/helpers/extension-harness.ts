@@ -76,6 +76,8 @@ export interface Harness {
 	statuses: Map<string, string | undefined>;
 	tools: Map<string, RegisteredToolLike>;
 	commands: RegisteredCommandLike[];
+	recoverManagedNamespace(): void;
+	replaceBranch(entries?: Array<Record<string, unknown>>): void;
 	abortCount: () => number;
 	rpcRequestCount: () => number;
 	emit(name: string, event: Record<string, unknown>): Promise<unknown[]>;
@@ -143,7 +145,9 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	const notifications: Array<{ message: string; level: string }> = [];
 	const statuses = new Map<string, string | undefined>();
 	const tools = new Map<string, RegisteredToolLike>();
+	const managedTools = new Map<string, RegisteredToolLike>();
 	const commands: RegisteredCommandLike[] = [];
+	let managedGoalCommand: RegisteredCommandLike | undefined;
 	const handlers = new Map<string, ExtensionHandler[]>();
 	let aborts = 0;
 	let idle = true;
@@ -185,12 +189,14 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	const piObject = {
 		events,
 		registerTool: (tool: unknown) => {
-			const candidate = tool as RegisteredToolLike;
-			if (!tools.has(candidate.name))
-				tools.set(candidate.name, { ...candidate, sourcePath: resolve("index.ts") });
+			const candidate = { ...(tool as RegisteredToolLike), sourcePath: resolve("index.ts") };
+			managedTools.set(candidate.name, candidate);
+			if (!tools.has(candidate.name)) tools.set(candidate.name, candidate);
 		},
 		registerCommand: (name: string, command: unknown) => {
-			commands.push({ name, ...(command as Omit<RegisteredCommandLike, "name">) });
+			const candidate = { name, ...(command as Omit<RegisteredCommandLike, "name">) };
+			if (name === "goal") managedGoalCommand = candidate;
+			commands.push(candidate);
 		},
 		on: (name: string, handler: ExtensionHandler) => {
 			const list = handlers.get(name) ?? [];
@@ -261,6 +267,16 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		statuses,
 		tools,
 		commands,
+		recoverManagedNamespace: () => {
+			for (const [name, tool] of managedTools) tools.set(name, tool);
+			for (let index = commands.length - 1; index >= 0; index -= 1) {
+				if (commands[index]?.name === "goal") commands.splice(index, 1);
+			}
+			if (managedGoalCommand) commands.push(managedGoalCommand);
+		},
+		replaceBranch: (entries = []) => {
+			branch.splice(0, branch.length, ...entries);
+		},
 		abortCount: () => aborts,
 		rpcRequestCount: () => rpcRequests,
 		emit,
