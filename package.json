@@ -1,6 +1,6 @@
 {
 	"name": "pi-subagents-goal",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"description": "Autonomous Pi goal loop with optional fail-closed pi-subagents coordination",
 	"type": "module",
 	"private": true,
@@ -23,6 +23,7 @@
 		"src/**/*.ts",
 		"README.md",
 		"LICENSE",
+		"CHANGELOG.md",
 		"docs/**/*.md"
 	],
 	"pi": {
@@ -39,6 +40,7 @@
 		"test:integration": "node --experimental-strip-types --test test/extension.test.ts",
 		"test:smoke": "npm run test:smoke:pi && node --experimental-strip-types test/smoke/local-pi-subagents-smoke.ts",
 		"test:smoke:pi": "node --experimental-strip-types test/smoke/pi-0830-load-smoke.ts",
+		"test:smoke:git": "node --experimental-strip-types test/smoke/git-install-smoke.ts",
 		"typecheck": "tsc --noEmit"
 	},
 	"engines": {
@@ -51,6 +53,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.5",
+		"@earendil-works/pi-agent-core": "0.83.0",
 		"@earendil-works/pi-ai": "0.83.0",
 		"@earendil-works/pi-coding-agent": "0.83.0",
 		"typebox": "1.3.7",

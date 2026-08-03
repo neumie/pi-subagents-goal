@@ -26,7 +26,7 @@ Only detached work launched through `goal_subagent` is intentionally unavailable
 Install the goal loop through Pi; it works without `pi-subagents`:
 
 ```bash
-pi install git:github.com/neumie/pi-subagents-goal
+pi install git:github.com/neumie/pi-subagents-goal@v0.2.2
 ```
 
 Optionally install the audited [`pi-subagents`](https://github.com/neumie/pi-subagents) revision to enable `goal_subagent` and `goal_review`:
@@ -34,6 +34,8 @@ Optionally install the audited [`pi-subagents`](https://github.com/neumie/pi-sub
 ```bash
 pi install git:github.com/neumie/pi-subagents@886bbad929134d7954a4fb34e532d82ac21e33e8
 ```
+
+An unpinned `git:github.com/neumie/pi-subagents-goal@main` install is for development only; use the immutable release tag above for normal installation.
 
 For development from a local checkout:
 
@@ -61,7 +63,7 @@ Control it explicitly:
 /goal cancel
 ```
 
-Starting a goal appends a digest-bound objective message and a value-free state snapshot to the current Pi session. The model receives goal instructions through `before_agent_start` on every active turn.
+Starting a goal appends a digest-bound objective message and a value-free state snapshot to the current Pi session. The model receives goal instructions through `before_agent_start` on active turns that Pi routes through that hook; custom trigger turns bypass `before_agent_start`, so the continuation message also carries the identity and instructions. Prompt injection is supplemental: state transitions and exact tool/event correlation are authoritative.
 
 ### Goal-owned tools
 
@@ -104,7 +106,7 @@ session ID + session file + lineage ID + goal ID + epoch + item ID + attempt
 
 Item IDs are globally unique within a goal and are never reused across attempts. A continuation uses a random nonce, a monotonic sequence, and the expected work generation. It can move only through `reserved -> queued -> running`, and new work invalidates a reservation. A queued continuation cannot admit more work.
 
-The extension commits the continuation ledger before calling Pi's `sendMessage(..., { triggerTurn: true })`. A synchronous enqueue failure faults the goal and is not retried. If a process reload restores a `reserved`, `queued`, or `running` continuation, delivery is ambiguous and the goal faults instead of risking a duplicate. This is exactly-once within an unambiguous live runtime and fail-closed across the remaining Pi crash window.
+The extension commits the continuation ledger before calling Pi's void `sendMessage(..., { triggerTurn: true })`. A synchronous enqueue failure faults the goal and is not retried. Delivery is tracked by an in-memory expected nonce; if it remains unobserved when Pi settles, the goal faults without retry. If a process reload restores a `reserved`, `queued`, or `running` continuation, delivery is ambiguous and the goal faults instead of risking a duplicate. This is exactly-once within an unambiguous live runtime and fail-closed across the remaining Pi crash window.
 
 Default goal budgets are:
 
@@ -113,7 +115,7 @@ Default goal budgets are:
 - no wall-clock limit;
 - 3 unchanged automatic turns.
 
-When an explicit token limit is supplied through the state-machine API, usage counts only parent output generated after goal start plus delegated child usage; pre-existing parent context is not charged. Explicit token and wall-clock limits must be positive finite integers. Foreground children retain a 10-minute timeout and `24 + 2` turn/grace budget.
+When an explicit token limit is supplied through the state-machine API, usage counts only parent output generated after goal start plus delegated child usage; pre-existing parent context is not charged. Explicit token and wall-clock limits must be positive finite integers. Foreground calls have a whole-call 10-minute default and 30-minute request limit; each item receives only remaining request time. The bridge additionally allows a fixed five-second protocol cleanup window, so the true outer response bound is requested timeout plus 5 seconds. Their hard turn/grace limits are `24 + 2` (default grace is 1), groups contain at most eight items, and the derived aggregate allowance is `8 × (24 + 2) = 208`.
 
 ## Status API and presentation ownership
 
@@ -142,6 +144,9 @@ npm run check
 npm run test:integration
 npm run test:smoke
 npm pack --dry-run
+
+# Hosted/CI only: requires an immutable reachable Git SHA
+PI_GOAL_GIT_SMOKE_REPOSITORY=owner/repository PI_GOAL_GIT_SMOKE_REF=<40-char-sha> npm run test:smoke:git
 ```
 
 `test:smoke` performs two bounded checks without invoking a model:
@@ -153,7 +158,7 @@ Hosted CI uses Node `22.19.0` to run the locked install, full quality gate, and 
 
 ### Known upstream audit residual
 
-`npm audit` reports `GHSA-mh99-v99m-4gvg` (high severity, unbounded brace expansion) in Pi 0.83.0's shrinkwrapped nested `brace-expansion@5.0.7`. A clean-install experiment confirmed that root overrides and `npm audit fix` cannot replace the nested package. This extension accepts no brace/minimatch input itself and ships no production dependency copy, but a clean host Pi package installation retains the advisory. Resolution requires a Pi release whose published shrinkwrap selects `brace-expansion>=5.0.8`.
+`npm audit` reports `GHSA-mh99-v99m-4gvg` (high severity, unbounded brace expansion) in Pi 0.83.0's shrinkwrapped nested `brace-expansion@5.0.7`. A clean-install experiment confirmed that root overrides and `npm audit fix` cannot replace the nested package; no effective local override exists. This extension accepts no brace/minimatch input itself and ships no production dependency copy, but a clean host Pi package installation retains the advisory. Resolution requires a Pi release whose published shrinkwrap selects `brace-expansion>=5.0.8`.
 
 See also:
 

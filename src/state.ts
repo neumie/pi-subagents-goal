@@ -178,6 +178,15 @@ const GOAL_PHASES = new Set<GoalPhase>([
 ]);
 const OUTPUT_STATES = new Set<OutputState>(["awaiting", "pending_surface", "surfaced", "consumed"]);
 const WORK_MODES = new Set<WorkMode>(["single", "parallel", "chain"]);
+
+export function saturatingTokenAdd(current: number, increment: number): number {
+	const safeCurrent = Number.isSafeInteger(current) && current > 0 ? current : 0;
+	if (!Number.isFinite(increment) || increment <= 0) return safeCurrent;
+	const safeIncrement = Math.floor(increment);
+	return safeIncrement >= Number.MAX_SAFE_INTEGER - safeCurrent
+		? Number.MAX_SAFE_INTEGER
+		: safeCurrent + safeIncrement;
+}
 const WORK_ROLES = new Set<WorkRole>(["work", "review"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -370,7 +379,7 @@ export class GoalMachine {
 		if (!this.#canAccountUsage()) return;
 		const tokens = Number.isFinite(input.tokens) && input.tokens > 0 ? Math.floor(input.tokens) : 0;
 		const usage = this.#state.budgetUsage;
-		usage.tokens += tokens;
+		usage.tokens = saturatingTokenAdd(usage.tokens, tokens);
 		if (this.#state.currentRunAutomatic) {
 			usage.automaticTurns += 1;
 			if (usage.lastProgressSignature === input.progressSignature) usage.noProgressTurns += 1;
@@ -385,7 +394,8 @@ export class GoalMachine {
 
 	recordExternalTokens(tokens: number, now: number): void {
 		if (!this.#canAccountUsage()) return;
-		if (Number.isFinite(tokens) && tokens > 0) this.#state.budgetUsage.tokens += Math.floor(tokens);
+		if (Number.isFinite(tokens) && tokens > 0)
+			this.#state.budgetUsage.tokens = saturatingTokenAdd(this.#state.budgetUsage.tokens, Math.floor(tokens));
 		this.#enforceBudgets(now);
 		this.#touch(now);
 	}
@@ -625,6 +635,11 @@ export class GoalMachine {
 		const blockers: string[] = [];
 		if (!exactOwnerMatch(input.owner, this.#state.owner)) blockers.push("owner identity does not match");
 		if (this.#state.phase !== "active") blockers.push(`goal phase is ${this.#state.phase}`);
+		// A reserved/queued continuation has not entered its correlated parent turn yet.
+		// A running ticket is deliberately allowed: goal_done is executing in that exact turn.
+		if (this.#state.continuation?.status === "reserved" || this.#state.continuation?.status === "queued") {
+			blockers.push("a continuation is reserved or queued");
+		}
 		this.#enforceBudgets(input.now);
 		if (this.#state.phase === "budget_exhausted") blockers.push("a finite goal budget is exhausted");
 		const active = this.#state.work.filter((item) => isActiveWorkState(item.state));

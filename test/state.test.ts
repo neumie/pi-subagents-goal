@@ -404,6 +404,24 @@ describe("finite budgets", () => {
 		assert.equal(target.reserveContinuation(NOW + 8), undefined);
 	});
 
+	it("saturates parent and external token accounting before persistence-safe overflow", () => {
+		const target = machine({ maxTokens: Number.MAX_SAFE_INTEGER - 1 });
+		target.recordTurn({
+			tokens: Number.MAX_SAFE_INTEGER,
+			progressSignature: "parent-overflow",
+			now: NOW + 1,
+		});
+		assert.equal(target.snapshot.budgetUsage.tokens, Number.MAX_SAFE_INTEGER);
+		assert.equal(target.snapshot.phase, "budget_exhausted");
+
+		const external = machine({ maxTokens: Number.MAX_SAFE_INTEGER - 1 });
+		external.recordExternalTokens(Number.MAX_SAFE_INTEGER - 2, NOW + 1);
+		external.recordExternalTokens(10, NOW + 2);
+		assert.equal(external.snapshot.budgetUsage.tokens, Number.MAX_SAFE_INTEGER);
+		assert.equal(external.snapshot.phase, "budget_exhausted");
+		assert.doesNotThrow(() => new GoalMachine(external.snapshot));
+	});
+
 	it("enforces token, wall-clock, and no-progress limits", () => {
 		const initialTokenTarget = machine({ maxTokens: 5, maxNoProgressTurns: 10 });
 		const initialTokenTicket = initialTokenTarget.queueInitialContinuation(NOW + 1);
@@ -464,6 +482,25 @@ describe("finite budgets", () => {
 		noProgressTarget.recordTurn({ tokens: 1, progressSignature: "same", now: NOW + 7 });
 		noProgressTarget.recordTurn({ tokens: 1, progressSignature: "same", now: NOW + 8 });
 		assert.equal(noProgressTarget.snapshot.phase, "budget_exhausted");
+	});
+});
+
+describe("completion continuation guard", () => {
+	it("blocks completion while a continuation is reserved or queued, but permits the exact running turn", () => {
+		const target = machine();
+		const reserved = target.reserveContinuation(NOW + 1);
+		assert.ok(reserved);
+		assert.match(
+			target.completionDecision({ owner: owner(), consideredItemIds: [], now: NOW + 2 }).blockers.join("\n"),
+			/reserved or queued/u,
+		);
+		assert.equal(target.commitContinuation(reserved, NOW + 3), true);
+		assert.match(
+			target.completionDecision({ owner: owner(), consideredItemIds: [], now: NOW + 4 }).blockers.join("\n"),
+			/reserved or queued/u,
+		);
+		assert.equal(target.agentStarted(NOW + 5, reserved.nonce), true);
+		assert.equal(target.completionDecision({ owner: owner(), consideredItemIds: [], now: NOW + 6 }).ok, true);
 	});
 });
 
