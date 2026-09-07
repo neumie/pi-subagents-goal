@@ -60,8 +60,16 @@ Control it explicitly:
 /goal status
 /goal pause
 /goal resume
-/goal cancel
+/goal stop
+/goal budget +10
+/goal budget no-progress +3
 ```
+
+`pause` is reversible. Pressing Pi's interrupt key (Escape by default) during a tracked goal turn also pauses the goal, so settlement cannot enqueue another continuation behind the user's back. Resume only with `/goal resume`. Output tokens produced before the interrupt remain accounted, but the aborted turn does not consume automatic-turn or no-progress budget.
+
+`stop` is terminal and non-resumable; start a new goal to continue later. `/goal cancel` and `/goal clear` remain compatibility aliases. The explicit command is the confirmation—there is no modal that can obstruct the emergency exit. Stop prevents future work but cannot roll back tool side effects that already completed.
+
+`budget +N` adds `N` automatic continuation turns. `budget turns +N` is the equivalent long form, and `budget no-progress +N` extends the unchanged-turn guard separately. Increases must be positive safe integers and are persisted. If the goal was exhausted, it moves to `paused` only after every exhausted dimension has been extended, and still requires explicit `/goal resume`; budget changes never restart work silently. `/goal budget` republishes current status for status consumers.
 
 Starting a goal appends a digest-bound objective message and a value-free state snapshot to the current Pi session. The model receives goal instructions through `before_agent_start` on active turns that Pi routes through that hook; custom trigger turns bypass `before_agent_start`, so the continuation message also carries the identity and instructions. Prompt injection is supplemental: state transitions and exact tool/event correlation are authoritative.
 
@@ -115,6 +123,8 @@ Default goal budgets are:
 - no wall-clock limit;
 - 3 unchanged automatic turns.
 
+The user can explicitly extend the two finite defaults with `/goal budget +N` and `/goal budget no-progress +N`. Token and wall-clock limits supplied through the state-machine API can also be increased through that API, but an unlimited dimension cannot be made "more unlimited." All increases are additive and overflow-checked.
+
 When an explicit token limit is supplied through the state-machine API, usage counts only parent output generated after goal start plus delegated child usage; pre-existing parent context is not charged. Explicit token and wall-clock limits must be positive finite integers. Foreground calls have a whole-call 10-minute default and 30-minute request limit; each item receives only remaining request time. The bridge additionally allows a fixed five-second protocol cleanup window, so the true outer response bound is requested timeout plus 5 seconds. Their hard turn/grace limits are `24 + 2` (default grace is 1), groups contain at most eight items, and the derived aggregate allowance is `8 × (24 + 2) = 208`.
 
 ## Status API and presentation ownership
@@ -134,7 +144,8 @@ Consumers receive objective, phase, timestamps, work counts, at most 128 recent 
 - The objective is stored separately in a displayed custom message and verified by SHA-256 digest.
 - Child output remains in normal tool-result/session context; snapshots retain only its digest and acknowledgement state.
 - Foreign session or fork metadata has no authority.
-- Clean shutdown pauses the goal and requires explicit `/goal resume`.
+- Clean shutdown or an interrupted tracked parent turn pauses the goal and requires explicit `/goal resume`.
+- `/goal stop` is terminal and cannot be resumed.
 - Nonterminal child state or ambiguous continuation state on restore faults the goal.
 
 ## Verification

@@ -11,7 +11,7 @@ This model covers the autonomous parent loop on Pi `0.83.0` and, when explicitly
 - **Work ledger integrity** — complete and accurate child lifecycle records.
 - **Output-consumption evidence** — proof that terminal output entered context and was explicitly considered.
 - **Completion integrity** — enabled budgets remain and any explicitly admitted goal-owned work is terminal, consumed, resolved where needed, and considered.
-- **Budget integrity** — finite turn/no-progress accounting plus optional token and wall-clock limits.
+- **Budget integrity** — finite turn/no-progress accounting, optional token and wall-clock limits, and explicit overflow-safe user increases.
 - **Session confidentiality** — objective and child output values must not leak into hidden coordination metadata.
 
 ## Trust assumptions
@@ -32,6 +32,7 @@ A malicious extension loaded into the same Pi process is inside the trust bounda
 - child timeout, interruption, process failure, or malformed result;
 - provider disappearance or reload;
 - parent settlement racing child terminal delivery;
+- a user interrupt being mistaken for successful settlement and retriggering autonomy;
 - crash between persistence and continuation enqueue;
 - model attempts to skip acknowledgement or resolution for optional goal-owned work;
 - work from an installed ordinary `subagent` running outside the goal-owned ledger;
@@ -50,6 +51,8 @@ A malicious extension loaded into the same Pi process is inside the trust bounda
 | Child terminates before parent | `parentSettled` remains false until an `agent_end` carrying the running continuation nonce arms settlement; one later reservation |
 | New work races reservation | Admission deletes `reserved`; admission after `queued` faults |
 | Two continuation sends | Monotonic ticket, random nonce, one continuation slot, commit comparison, no automatic retry |
+| Escape/abort restarts the autonomous loop | A tracked assistant `stopReason: "aborted"` durably pauses before settlement; continuation expectations are cleared and resume is explicit |
+| User cannot terminate autonomy | Canonical `/goal stop` clears continuation authority, aborts in-flight work, and is non-resumable; `cancel`/`clear` remain aliases |
 | Crash makes send status unknowable | Any restored `reserved`, `queued`, or `running` continuation faults instead of resending |
 | Child output omitted from context | `pending_surface` blocks consumption; output-bearing continuation or goal tool result must mark `surfaced` |
 | Model invents acknowledgement | Timing-safe comparison with a random exact token and item ID |
@@ -61,6 +64,8 @@ A malicious extension loaded into the same Pi process is inside the trust bounda
 | Unsafe compaction removes evidence | Compaction blocked with nonterminal work or unconsumed output |
 | Reload loses foreground child | Restore with a nonterminal child faults |
 | Unlimited autonomy | Parent automatic-turn/no-progress and child timeout/turn budgets remain finite by default; token and wall-clock caps are explicitly optional |
+| Budget silently expands or restarts work | Only an explicit user command/state-machine call can add a positive bounded delta; overflow is rejected; exhausted goals recover to paused and require explicit resume |
+| Wrong budget increase bypasses another guard | Exhausted dimensions are recomputed after mutation; the goal remains exhausted until every exceeded limit is extended |
 | Pre-existing context exhausts a goal cap | Parent accounting uses newly generated output only; delegated terminal usage is added before continuation eligibility, including while paused/cancelling |
 | Oversized output hides tokens | Per-child and aggregate previews bounded; every token emitted in a separate untruncated list |
 | Malformed persisted metadata | Field-by-field and cross-field lifecycle validation; no trusted cast |

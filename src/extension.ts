@@ -38,6 +38,7 @@ import {
 	isActiveWorkState,
 	isTerminalWorkState,
 	sha256,
+	type BudgetIncrease,
 	type CompletionRequest,
 	type ContinuationTicket,
 	type GoalSnapshot,
@@ -45,6 +46,7 @@ import {
 } from "./state.ts";
 
 const MAX_OBJECTIVE_BYTES = 10_000;
+const GOAL_BUDGET_USAGE = "Usage: /goal budget +<turns> or /goal budget no-progress +<turns>.";
 const CONTINUATION_TRUNCATION_MARKER =
 	"\n[Child preview truncated; inspect its child session before acknowledgement if omitted evidence matters.]";
 const CONTINUATION_NONCE_PREFIX = "Goal continuation nonce: ";
@@ -56,6 +58,38 @@ export const GOAL_TOOL_NAMES = [
 	"goal_review",
 	"goal_done",
 ] as const;
+
+const GOAL_CONTROL_COMPLETIONS = [
+	{ value: "status", label: "status", description: "Show current goal state and budget" },
+	{ value: "pause", label: "pause", description: "Pause safely; the goal remains resumable" },
+	{ value: "resume", label: "resume", description: "Resume a paused goal" },
+	{ value: "stop", label: "stop", description: "Permanently stop the current goal" },
+	{ value: "budget +5", label: "budget +5", description: "Add automatic continuation turns" },
+	{
+		value: "budget no-progress +3",
+		label: "budget no-progress +3",
+		description: "Allow more unchanged automatic turns",
+	},
+] as const;
+
+type GoalControl =
+	| { kind: "status" }
+	| { kind: "pause" }
+	| { kind: "resume" }
+	| { kind: "budgetStatus" }
+	| { kind: "increaseBudget"; increase: BudgetIncrease }
+	| { kind: "stop" };
+
+const SIMPLE_GOAL_CONTROLS = new Map<string, GoalControl>([
+	["", { kind: "status" }],
+	["status", { kind: "status" }],
+	["pause", { kind: "pause" }],
+	["resume", { kind: "resume" }],
+	["budget", { kind: "budgetStatus" }],
+	["stop", { kind: "stop" }],
+	["cancel", { kind: "stop" }],
+	["clear", { kind: "stop" }],
+]);
 
 const TaskSchema = Type.Object(
 	{
@@ -173,8 +207,45 @@ interface RuntimeContextIdentity {
 	sessionFile: string | null;
 }
 
+interface PendingTurnUsage {
+	tokens: number;
+	progressSignature: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isAbortedAssistantMessage(message: unknown): boolean {
+	return isRecord(message) && message.role === "assistant" && message.stopReason === "aborted";
+}
+
+function parseBudgetIncreaseCommand(command: string): BudgetIncrease | undefined {
+	const match = /^budget(?:\s+(turns|no-progress))?\s+\+([1-9]\d*)$/u.exec(command);
+	if (!match) return undefined;
+	const amount = Number(match[2]);
+	if (!Number.isSafeInteger(amount)) {
+		throw new GoalInvariantError("Budget increase must be a positive safe integer.");
+	}
+	return match[1] === "no-progress" ? { noProgressTurns: amount } : { automaticTurns: amount };
+}
+
+function parseGoalControl(command: string): GoalControl | undefined {
+	const simple = SIMPLE_GOAL_CONTROLS.get(command);
+	if (simple) return simple;
+	if (!command.startsWith("budget ")) return undefined;
+	const increase = parseBudgetIncreaseCommand(command);
+	if (!increase) throw new GoalInvariantError(GOAL_BUDGET_USAGE);
+	return { kind: "increaseBudget", increase };
+}
+
+function normalizeGoalObjective(rawObjective: string): string {
+	const objective = rawObjective.startsWith("start ") ? rawObjective.slice(6).trim() : rawObjective;
+	if (!objective) throw new GoalInvariantError("Usage: /goal <objective>");
+	if (utf8ByteLength(objective) > MAX_OBJECTIVE_BYTES) {
+		throw new GoalInvariantError(`Goal objective must be at most ${MAX_OBJECTIVE_BYTES} UTF-8 bytes.`);
+	}
+	return objective;
 }
 
 function sessionIdentity(ctx: ExtensionContext): RuntimeContextIdentity {
@@ -333,6 +404,23 @@ function extensionSystemPrompt(objective: string, snapshot: GoalSnapshot): strin
 	].join("\n");
 }
 
+function initialContinuationContent(
+	objective: string,
+	snapshot: GoalSnapshot,
+	initial: ContinuationTicket,
+): string {
+	return [
+		`${CONTINUATION_NONCE_PREFIX}${initial.nonce}`,
+		`Begin working autonomously toward: ${objective}`,
+		"",
+		"Exact identity for every goal_* call (do not search for it elsewhere):",
+		`- goalId: ${snapshot.owner.goalId}`,
+		`- epoch: ${snapshot.owner.epoch}`,
+		"Work directly with ordinary tools. pi-subagents, goal_subagent, and goal_review are optional.",
+		"If goal-owned work is used, acknowledge every surfaced output and resolve unsuccessful outcomes before goal_done. An empty consideredItemIds list is valid when no goal-owned work was launched.",
+	].join("\n");
+}
+
 export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	let namespaceFault: string | undefined;
 	let machine: GoalMachine | undefined;
@@ -347,7 +435,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	let latestStatus: GoalStatusEnvelope | undefined;
 	let runtimeEpoch = 0;
 	let pendingContinuationNonce: string | undefined;
+	let pendingInterruptedTurnUsage: PendingTurnUsage | undefined;
 	let currentRunTracked = false;
+	let currentRunInterrupted = false;
 	let runningContinuationObserved = false;
 	const expectedContinuationNonces = new Set<string>();
 	let goalToolTail: Promise<void> = Promise.resolve();
@@ -552,7 +642,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		namespaceFault = undefined;
 		runtimeEpoch += 1;
 		pendingContinuationNonce = undefined;
+		pendingInterruptedTurnUsage = undefined;
 		currentRunTracked = false;
+		currentRunInterrupted = false;
 		runningContinuationObserved = false;
 		expectedContinuationNonces.clear();
 		outputCache.clear();
@@ -613,88 +705,111 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		publishStatus(ctx);
 	};
 
-	pi.registerCommand("goal", {
-		description: "Start or control an autonomous goal loop with optional pi-subagents coordination",
-		handler: async (args, ctx) => {
-			assertNamespace();
-			const trimmed = args.trim();
-			const command = trimmed.toLowerCase();
-			if (!trimmed || command === "status") {
+	const startGoal = (rawObjective: string, ctx: ExtensionContext) => {
+		if (machine && isLivePhase(machine.snapshot.phase)) {
+			throw new GoalInvariantError("This session already has a live goal.");
+		}
+		if (!ctx.isIdle()) throw new GoalInvariantError("Wait for Pi to settle before starting /goal.");
+		const goalObjective = normalizeGoalObjective(rawObjective);
+		const now = Date.now();
+		const next = new GoalMachine(
+			createGoalSnapshot({ owner: ownerForContext(ctx), objective: goalObjective, now }),
+		);
+		machine = next;
+		objective = goalObjective;
+		const initial = next.queueInitialContinuation(now);
+		persist();
+		expectedContinuationNonces.add(initial.nonce);
+		try {
+			const snapshot = next.snapshot;
+			pi.sendMessage(objectiveMessage(goalObjective, snapshot), { deliverAs: "followUp" });
+			sendContinuation(initialContinuationContent(goalObjective, snapshot, initial), snapshot.owner, initial);
+		} catch (error) {
+			expectedContinuationNonces.delete(initial.nonce);
+			next.fault(
+				`Initial goal turn could not be queued: ${error instanceof Error ? error.message : String(error)}`,
+				Date.now(),
+			);
+			persist();
+			publishStatus(ctx);
+			throw error;
+		}
+		publishStatus(ctx);
+	};
+
+	const handleGoalControl = (control: GoalControl, ctx: ExtensionContext) => {
+		switch (control.kind) {
+			case "status":
 				publishStatus(ctx);
 				return;
-			}
-			if (command === "pause") {
+			case "pause": {
 				const active = requireMachine(ctx);
-				if (!active.pause("Paused explicitly by the user.", Date.now()))
+				if (
+					!active.pause(
+						"Paused explicitly by the user. Resume with /goal resume or stop with /goal stop.",
+						Date.now(),
+					)
+				) {
 					throw new GoalInvariantError("Goal cannot be paused from its current phase.");
+				}
 				expectedContinuationNonces.clear();
+				pendingContinuationNonce = undefined;
 				persist();
 				if (!ctx.isIdle()) ctx.abort();
 				publishStatus(ctx);
 				return;
 			}
-			if (command === "resume") {
+			case "resume": {
 				if (!ctx.isIdle()) throw new GoalInvariantError("Wait for Pi to settle before resuming /goal.");
 				const active = requireMachine(ctx);
-				if (!active.resume(Date.now()))
+				if (!active.resume(Date.now())) {
 					throw new GoalInvariantError("Goal cannot resume while work is active or the phase is not paused.");
+				}
 				persist();
 				publishStatus(ctx);
 				dispatchContinuation(ctx);
 				return;
 			}
-			if (command === "cancel" || command === "clear") {
-				const active = requireMachine(ctx);
-				active.cancel(Date.now());
+			case "budgetStatus":
+				requireMachine(ctx);
+				publishStatus(ctx);
+				return;
+			case "increaseBudget":
+				requireMachine(ctx).increaseBudget(control.increase, Date.now());
+				persist();
+				publishStatus(ctx);
+				return;
+			case "stop":
+				requireMachine(ctx).cancel(Date.now());
 				expectedContinuationNonces.clear();
+				pendingContinuationNonce = undefined;
 				persist();
 				if (!ctx.isIdle()) ctx.abort();
 				publishStatus(ctx);
 				return;
+			default: {
+				const unsupported: never = control;
+				throw new GoalInvariantError(`Unsupported goal control: ${String(unsupported)}`);
 			}
-			if (machine && isLivePhase(machine.snapshot.phase))
-				throw new GoalInvariantError("This session already has a live goal.");
-			if (!ctx.isIdle()) throw new GoalInvariantError("Wait for Pi to settle before starting /goal.");
-			const goalObjective = trimmed.startsWith("start ") ? trimmed.slice(6).trim() : trimmed;
-			if (!goalObjective) throw new GoalInvariantError("Usage: /goal <objective>");
-			if (utf8ByteLength(goalObjective) > MAX_OBJECTIVE_BYTES) {
-				throw new GoalInvariantError(`Goal objective must be at most ${MAX_OBJECTIVE_BYTES} UTF-8 bytes.`);
+		}
+	};
+
+	pi.registerCommand("goal", {
+		description: "Start or control a goal: status, pause, resume, stop, or increase its budget",
+		getArgumentCompletions: (prefix) => {
+			const query = prefix.trim().toLowerCase();
+			const matches = GOAL_CONTROL_COMPLETIONS.filter((item) => item.value.startsWith(query));
+			return matches.length > 0 ? [...matches] : null;
+		},
+		handler: async (args, ctx) => {
+			assertNamespace();
+			const trimmed = args.trim();
+			const control = parseGoalControl(trimmed.toLowerCase());
+			if (control) {
+				handleGoalControl(control, ctx);
+				return;
 			}
-			machine = new GoalMachine(
-				createGoalSnapshot({ owner: ownerForContext(ctx), objective: goalObjective, now: Date.now() }),
-			);
-			objective = goalObjective;
-			const initial = machine.queueInitialContinuation(Date.now());
-			persist();
-			expectedContinuationNonces.add(initial.nonce);
-			try {
-				const snapshot = machine.snapshot;
-				pi.sendMessage(objectiveMessage(goalObjective, snapshot), { deliverAs: "followUp" });
-				sendContinuation(
-					[
-						`${CONTINUATION_NONCE_PREFIX}${initial.nonce}`,
-						`Begin working autonomously toward: ${goalObjective}`,
-						"",
-						"Exact identity for every goal_* call (do not search for it elsewhere):",
-						`- goalId: ${snapshot.owner.goalId}`,
-						`- epoch: ${snapshot.owner.epoch}`,
-						"Work directly with ordinary tools. pi-subagents, goal_subagent, and goal_review are optional.",
-						"If goal-owned work is used, acknowledge every surfaced output and resolve unsuccessful outcomes before goal_done. An empty consideredItemIds list is valid when no goal-owned work was launched.",
-					].join("\n"),
-					snapshot.owner,
-					initial,
-				);
-			} catch (error) {
-				expectedContinuationNonces.delete(initial.nonce);
-				machine.fault(
-					`Initial goal turn could not be queued: ${error instanceof Error ? error.message : String(error)}`,
-					Date.now(),
-				);
-				persist();
-				publishStatus(ctx);
-				throw error;
-			}
-			publishStatus(ctx);
+			startGoal(trimmed, ctx);
 		},
 	});
 
@@ -941,7 +1056,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		expectedContinuationNonces.delete(nonce);
 		if (!machine.agentStarted(Date.now(), nonce)) return;
 		pendingContinuationNonce = undefined;
+		pendingInterruptedTurnUsage = undefined;
 		currentRunTracked = true;
+		currentRunInterrupted = false;
 		runningContinuationObserved = true;
 		persist();
 		publishStatus(ctx);
@@ -963,7 +1080,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	pi.on("agent_start", (_event, ctx) => {
 		if (!machine) {
 			pendingContinuationNonce = undefined;
+			pendingInterruptedTurnUsage = undefined;
 			currentRunTracked = false;
+			currentRunInterrupted = false;
 			runningContinuationObserved = false;
 			return;
 		}
@@ -975,6 +1094,8 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		pendingContinuationNonce = undefined;
 		currentRunTracked = started || preserveTrackedRun;
 		if (!started) return;
+		pendingInterruptedTurnUsage = undefined;
+		currentRunInterrupted = false;
 		persist();
 		publishStatus(ctx);
 	});
@@ -984,6 +1105,8 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		const snapshot = machine.snapshot;
 		if (snapshot.currentRunEndObserved) return;
 		const continuation = snapshot.continuation;
+		const interrupted = currentRunInterrupted || event.messages.some(isAbortedAssistantMessage);
+		const now = Date.now();
 		// Pi can emit an empty agent_end for a custom-trigger turn. Only the exact locally observed
 		// continuation message_start authorizes that empty-message fallback; nonempty ends still re-check identity.
 		if (
@@ -993,25 +1116,38 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		) {
 			machine.fault(
 				"Parent agent_end did not carry the running continuation nonce; lifecycle identity is ambiguous.",
-				Date.now(),
+				now,
 			);
+		} else if (interrupted) {
+			machine.interrupt(
+				"Parent turn was interrupted; goal paused. Resume with /goal resume or stop with /goal stop.",
+				now,
+			);
+			if (pendingInterruptedTurnUsage) {
+				machine.recordTurn({ ...pendingInterruptedTurnUsage, now });
+			}
+			expectedContinuationNonces.clear();
+			pendingContinuationNonce = undefined;
 		} else {
-			machine.agentEnded(
-				Date.now(),
-				continuation?.status === "running" ? continuation.ticket.nonce : undefined,
-			);
+			machine.agentEnded(now, continuation?.status === "running" ? continuation.ticket.nonce : undefined);
 		}
+		pendingInterruptedTurnUsage = undefined;
 		persist();
 		publishStatus(ctx);
 	});
 
 	pi.on("turn_end", (event, ctx) => {
 		if (!machine || !currentRunTracked) return;
-		machine.recordTurn({
+		const usage: PendingTurnUsage = {
 			tokens: turnOutputTokens(event),
 			progressSignature: turnProgressSignature(event),
-			now: Date.now(),
-		});
+		};
+		if (isAbortedAssistantMessage(event.message)) {
+			currentRunInterrupted = true;
+			pendingInterruptedTurnUsage = usage;
+			return;
+		}
+		machine.recordTurn({ ...usage, now: Date.now() });
 		persist();
 		publishStatus(ctx);
 	});
@@ -1037,7 +1173,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			return;
 		}
 		const ticket = machine.agentSettled(Date.now());
+		pendingInterruptedTurnUsage = undefined;
 		currentRunTracked = false;
+		currentRunInterrupted = false;
 		runningContinuationObserved = false;
 		persist();
 		publishStatus(ctx);
@@ -1086,8 +1224,10 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			compatibility = undefined;
 			compatibilitySessionId = undefined;
 			pendingContinuationNonce = undefined;
+			pendingInterruptedTurnUsage = undefined;
 			expectedContinuationNonces.clear();
 			currentRunTracked = false;
+			currentRunInterrupted = false;
 			runningContinuationObserved = false;
 			currentCtx = undefined;
 			latestStatus = undefined;

@@ -34,6 +34,9 @@ interface RegisteredToolLike {
 
 interface RegisteredCommandLike {
 	name: string;
+	getArgumentCompletions?(
+		prefix: string,
+	): Array<{ value: string; label: string; description?: string }> | null;
 	handler(args: string, ctx: ExtensionContext): Promise<void> | void;
 }
 

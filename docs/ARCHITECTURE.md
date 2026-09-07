@@ -18,7 +18,8 @@ A pure, serializable state machine owns all safety invariants:
 - output digests, surfacing state, and acknowledgement tokens;
 - unsuccessful-outcome resolutions;
 - continuation reservation/commit state;
-- enabled budget use and optional token/time limits;
+- enabled budget use, optional token/time limits, and overflow-safe additive budget increases;
+- exact exhausted-dimension reporting and explicit-resume recovery after an increase;
 - optional advisory review evidence;
 - runtime validation of restored snapshots.
 
@@ -58,7 +59,8 @@ Parallel concurrency is bounded at four. Chains replace `{previous}` with the pr
 
 The adapter owns side effects:
 
-- one `/goal` command;
+- one `/goal` command with discoverable status, pause, resume, stop, and budget controls;
+- automatic conversion of an aborted tracked parent turn into a durable pause;
 - five optional `goal_*` coordination tools;
 - lazy `pi-subagents` compatibility probing only when `goal_subagent` or `goal_review` is called;
 - session-native persistence;
@@ -146,6 +148,8 @@ The adapter persists `queued` before calling Pi `sendMessage(..., { triggerTurn:
 
 A synchronous send failure faults the goal and is never retried. On restore, any persisted `reserved`, `queued`, or `running` continuation is ambiguous and faults. This prevents duplicate recovery sends at the cost of stopping after an unprovable crash window.
 
+A tracked assistant turn ending with Pi's `stopReason: "aborted"` is latched at `turn_end`, then transitions the goal to `paused` only after `agent_end` validates the running continuation nonce. The adapter accounts any generated output tokens after pausing, so the aborted turn does not consume automatic-turn or no-progress budget, clears pending delivery expectations, and requires explicit `/goal resume`. `/goal stop` instead transitions through the existing terminal cancellation path. Budget increases are persisted state-machine mutations. Recovering from `budget_exhausted` yields `paused`, never `active`, and only after every exhausted budget dimension is below its new limit.
+
 Duplicate `agent_start` is idempotent and cannot clear automatic-run accounting. A running continuation accepts `agent_end` only when that event's initiating prompt carries the exact continuation nonce; a stale mismatched end faults the goal. Later low-level retry ends are ignored after the run is armed. `agent_settled` is ignored until a nonce-correlated end has been observed, preventing a stale end/settlement pair from consuming a newly running continuation.
 
 Both child/parent event orders are supported:
@@ -205,6 +209,9 @@ Those values remain in normal Pi messages/tool results. Snapshot fields retain o
 | `session_before_fork` | block live/unresolved goal |
 | `session_before_tree` | block live/unresolved goal |
 | `session_before_compact` | block if child is nonterminal or output unconsumed |
+| tracked parent `turn_end` / `agent_end` with `stopReason: "aborted"` | pause, clear continuation expectations, never auto-continue |
+| `/goal stop` | cancel active work and become terminal/non-resumable once owned work settles |
+| budget increase while exhausted | remain exhausted if another dimension is exhausted; otherwise become paused |
 | `session_shutdown` | pause active goal and persist |
 | `session_start` clean paused state | restore; explicit resume required |
 | `session_start` nonterminal child | fault |

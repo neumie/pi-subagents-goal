@@ -63,6 +63,13 @@ export interface BudgetUsage {
 	lastProgressSignature?: string;
 }
 
+export interface BudgetIncrease {
+	automaticTurns?: number;
+	tokens?: number;
+	wallClockMs?: number;
+	noProgressTurns?: number;
+}
+
 export interface WorkItem {
 	itemId: string;
 	attempt: number;
@@ -279,6 +286,56 @@ function validateBudgetLimits(limits: BudgetLimits): void {
 	assertFinitePositiveInteger(limits.maxNoProgressTurns, "maxNoProgressTurns");
 }
 
+function increasedLimit(current: number, increment: number, field: string): number {
+	assertFinitePositiveInteger(increment, field);
+	if (increment > Number.MAX_SAFE_INTEGER - current) {
+		throw new GoalInvariantError(`${field} would exceed the maximum safe integer.`);
+	}
+	return current + increment;
+}
+
+function optionalIncreasedLimit(
+	current: number | null,
+	increment: number | undefined,
+	field: "tokens" | "wallClockMs",
+): number | null {
+	if (increment === undefined) return current;
+	if (current === null) {
+		const label = field === "tokens" ? "token" : "wall-clock";
+		throw new GoalInvariantError(`The ${label} budget is unlimited and cannot be increased.`);
+	}
+	return increasedLimit(current, increment, field);
+}
+
+function increasedBudgetLimits(current: BudgetLimits, increase: BudgetIncrease): BudgetLimits {
+	if (increase === null || typeof increase !== "object" || Array.isArray(increase)) {
+		throw new GoalInvariantError("Budget increase is invalid.");
+	}
+	const entries = Object.entries(increase as Record<string, unknown>).filter(
+		(entry) => entry[1] !== undefined,
+	);
+	if (entries.length === 0) throw new GoalInvariantError("At least one budget increase is required.");
+	const knownFields = new Set(["automaticTurns", "tokens", "wallClockMs", "noProgressTurns"]);
+	if (entries.some(([field]) => !knownFields.has(field))) {
+		throw new GoalInvariantError("Budget increase contains an unknown field.");
+	}
+
+	const next: BudgetLimits = {
+		maxAutomaticTurns:
+			increase.automaticTurns === undefined
+				? current.maxAutomaticTurns
+				: increasedLimit(current.maxAutomaticTurns, increase.automaticTurns, "automaticTurns"),
+		maxTokens: optionalIncreasedLimit(current.maxTokens, increase.tokens, "tokens"),
+		maxWallClockMs: optionalIncreasedLimit(current.maxWallClockMs, increase.wallClockMs, "wallClockMs"),
+		maxNoProgressTurns:
+			increase.noProgressTurns === undefined
+				? current.maxNoProgressTurns
+				: increasedLimit(current.maxNoProgressTurns, increase.noProgressTurns, "noProgressTurns"),
+	};
+	validateBudgetLimits(next);
+	return next;
+}
+
 export function createGoalSnapshot(input: {
 	owner: OwnerIdentity;
 	objective: string;
@@ -381,9 +438,10 @@ export class GoalMachine {
 		const usage = this.#state.budgetUsage;
 		usage.tokens = saturatingTokenAdd(usage.tokens, tokens);
 		if (this.#state.currentRunAutomatic) {
-			usage.automaticTurns += 1;
-			if (usage.lastProgressSignature === input.progressSignature) usage.noProgressTurns += 1;
-			else {
+			usage.automaticTurns = saturatingTokenAdd(usage.automaticTurns, 1);
+			if (usage.lastProgressSignature === input.progressSignature) {
+				usage.noProgressTurns = saturatingTokenAdd(usage.noProgressTurns, 1);
+			} else {
 				usage.lastProgressSignature = input.progressSignature;
 				usage.noProgressTurns = 0;
 			}
@@ -398,6 +456,29 @@ export class GoalMachine {
 			this.#state.budgetUsage.tokens = saturatingTokenAdd(this.#state.budgetUsage.tokens, Math.floor(tokens));
 		this.#enforceBudgets(now);
 		this.#touch(now);
+	}
+
+	increaseBudget(increase: BudgetIncrease, now: number): BudgetLimits {
+		if (!(["active", "paused", "budget_exhausted"] as GoalPhase[]).includes(this.#state.phase)) {
+			throw new GoalInvariantError(`Cannot increase budget while goal phase is ${this.#state.phase}.`);
+		}
+		const activeBudgetWasExhausted = this.#state.phase === "active" && this.#exhaustedBudgets(now).length > 0;
+		const next = increasedBudgetLimits(this.#state.budgetLimits, increase);
+		this.#state.budgetLimits = next;
+
+		if (this.#state.phase === "budget_exhausted" || activeBudgetWasExhausted) {
+			const exhausted = this.#exhaustedBudgets(now);
+			this.#state.phase = exhausted.length === 0 ? "paused" : "budget_exhausted";
+			this.#state.pauseReason =
+				exhausted.length === 0
+					? "Budget increased; explicit /goal resume is required."
+					: this.#budgetExhaustionReason(exhausted, true);
+			this.#state.currentRunAutomatic = false;
+			this.#state.currentRunEndObserved = false;
+			delete this.#state.continuation;
+		}
+		this.#touch(now);
+		return structuredClone(next);
 	}
 
 	agentSettled(now: number): ContinuationTicket | undefined {
@@ -689,6 +770,18 @@ export class GoalMachine {
 		return true;
 	}
 
+	interrupt(reason: string, now: number): boolean {
+		if (this.#state.phase !== "active" && this.#state.phase !== "budget_exhausted") return false;
+		const budgetReason = this.#state.phase === "budget_exhausted" ? this.#state.pauseReason : undefined;
+		this.#state.phase = "paused";
+		this.#state.pauseReason = [reason, budgetReason].filter(Boolean).join(" ").slice(0, 500);
+		this.#state.currentRunAutomatic = false;
+		this.#state.currentRunEndObserved = false;
+		delete this.#state.continuation;
+		this.#touch(now);
+		return true;
+	}
+
 	resume(now: number): boolean {
 		if (this.#state.phase !== "paused") return false;
 		if (this.#state.work.some((item) => isActiveWorkState(item.state))) return false;
@@ -757,19 +850,35 @@ export class GoalMachine {
 		return this.#state.work.every((item) => item.outputState !== "awaiting");
 	}
 
-	#enforceBudgets(now: number): void {
-		if (this.#state.phase !== "active") return;
+	#exhaustedBudgets(now: number): Array<keyof BudgetIncrease> {
 		const limits = this.#state.budgetLimits;
 		const usage = this.#state.budgetUsage;
-		const exhausted =
-			usage.automaticTurns >= limits.maxAutomaticTurns ||
-			(limits.maxTokens !== null && usage.tokens >= limits.maxTokens) ||
-			usage.noProgressTurns >= limits.maxNoProgressTurns ||
-			(limits.maxWallClockMs !== null && now - this.#state.startedAt >= limits.maxWallClockMs);
-		if (!exhausted) return;
+		const exhausted: Array<keyof BudgetIncrease> = [];
+		if (usage.automaticTurns >= limits.maxAutomaticTurns) exhausted.push("automaticTurns");
+		if (limits.maxTokens !== null && usage.tokens >= limits.maxTokens) exhausted.push("tokens");
+		if (usage.noProgressTurns >= limits.maxNoProgressTurns) exhausted.push("noProgressTurns");
+		if (limits.maxWallClockMs !== null && now - this.#state.startedAt >= limits.maxWallClockMs) {
+			exhausted.push("wallClockMs");
+		}
+		return exhausted;
+	}
+
+	#budgetExhaustionReason(exhausted: Array<keyof BudgetIncrease>, still = false): string {
+		const labels: Record<keyof BudgetIncrease, string> = {
+			automaticTurns: "automatic turns",
+			tokens: "tokens",
+			wallClockMs: "wall-clock time",
+			noProgressTurns: "unchanged turns",
+		};
+		return `Budget ${still ? "is still " : ""}exhausted: ${exhausted.map((field) => labels[field]).join(", ")}. Increase the relevant limit before resuming.`;
+	}
+
+	#enforceBudgets(now: number): void {
+		if (this.#state.phase !== "active") return;
+		const exhausted = this.#exhaustedBudgets(now);
+		if (exhausted.length === 0) return;
 		this.#state.phase = "budget_exhausted";
-		this.#state.pauseReason =
-			"An enabled automatic-turn, token, wall-clock, or no-progress budget was exhausted.";
+		this.#state.pauseReason = this.#budgetExhaustionReason(exhausted);
 		this.#state.currentRunAutomatic = false;
 		this.#state.currentRunEndObserved = false;
 		delete this.#state.continuation;

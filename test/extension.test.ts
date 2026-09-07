@@ -130,6 +130,11 @@ describe("Pi extension registration and ownership", () => {
 			"goal_subagent",
 		]);
 		assert.equal(harness.commands.filter((command) => command.name === "goal").length, 1);
+		const completions = harness.commands
+			.find((command) => command.name === "goal")
+			?.getArgumentCompletions?.("");
+		assert.ok(completions?.some((item) => item.value === "stop"));
+		assert.ok(completions?.some((item) => item.value.startsWith("budget +")));
 		const doneSchema = record(record(harness.tools.get("goal_done")).parameters);
 		const doneProperties = record(doneSchema.properties);
 		assert.equal("reviewToken" in doneProperties, true);
@@ -222,6 +227,27 @@ describe("Pi extension registration and ownership", () => {
 		assert.ok((statuses.at(-1)?.sequence ?? 0) > (active?.sequence ?? 0));
 		assert.deepEqual(harness.notifications, []);
 		assert.equal(harness.statuses.size, 0);
+	});
+
+	it("exposes explicit stop and persisted budget-increase controls", async () => {
+		const harness = createHarness();
+		await startGoal(harness);
+
+		await harness.command("budget +5");
+		assert.equal(latestSnapshot(harness).budgetLimits.maxAutomaticTurns, 25);
+		await harness.command("budget turns +1");
+		assert.equal(latestSnapshot(harness).budgetLimits.maxAutomaticTurns, 26);
+		await harness.command("budget no-progress +2");
+		assert.equal(latestSnapshot(harness).budgetLimits.maxNoProgressTurns, 5);
+		await assert.rejects(harness.command("budget +0"), /Usage: \/goal budget/u);
+		await assert.rejects(harness.command("budget +9007199254740991"), /maximum safe integer/u);
+		assert.equal(latestSnapshot(harness).budgetLimits.maxAutomaticTurns, 26);
+
+		await harness.command("stop");
+		assert.equal(latestSnapshot(harness).phase, "cancelled");
+		assert.equal(latestSnapshot(harness).continuation, undefined);
+		await assert.rejects(harness.command("resume"), /No live \/goal/u);
+		assert.equal(harness.sentMessages.length, 2);
 	});
 
 	it("does not intercept ordinary subagent or other tool calls", async () => {
@@ -459,7 +485,7 @@ describe("foreground goal flow", () => {
 		assert.equal(harness.sentMessages.length, 2, "cancelled work must not enqueue a goal followUp");
 	});
 
-	it("persists an in-flight child cancellation as an explicit terminal goal", async () => {
+	it("stops in-flight owned work and persists an explicit terminal goal", async () => {
 		let pending = false;
 		const harness = createHarness({
 			provider: () => {
@@ -472,11 +498,11 @@ describe("foreground goal flow", () => {
 			goalId: owner.goalId,
 			epoch: owner.epoch,
 			agent: "worker",
-			task: "wait for cancellation",
+			task: "wait for stop",
 		});
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		assert.equal(pending, true);
-		await harness.command("cancel");
+		await harness.command("stop");
 		const result = details(await workPromise);
 		assert.equal(result.itemIds.length, 1);
 		const snapshot = latestSnapshot(harness);
@@ -740,6 +766,96 @@ describe("continuation delivery and completion races", () => {
 		assert.equal(snapshot.budgetUsage.automaticTurns, 0);
 		assert.equal(snapshot.budgetLimits.maxTokens, null);
 		assert.equal(snapshot.phase, "active");
+	});
+
+	it("pauses an interrupted parent turn instead of dispatching another continuation", async () => {
+		const harness = createHarness();
+		await startGoal(harness);
+		await markInitialTurnRunning(harness);
+		const interrupted = {
+			role: "assistant",
+			content: [],
+			stopReason: "aborted",
+			usage: { output: 0 },
+		};
+		await harness.emit("turn_end", {
+			type: "turn_end",
+			message: interrupted,
+			toolResults: [],
+		});
+		const messages = harness.branch.flatMap((entry) =>
+			entry.type === "message" ? [record(entry.message)] : [],
+		);
+		await harness.emit("agent_end", { type: "agent_end", messages: [...messages, interrupted] });
+		await harness.emit("agent_settled", { type: "agent_settled" });
+
+		const snapshot = latestSnapshot(harness);
+		assert.equal(snapshot.phase, "paused");
+		assert.match(snapshot.pauseReason ?? "", /interrupted/u);
+		assert.equal(snapshot.continuation, undefined);
+		assert.equal(harness.sentMessages.length, 2, "an interrupted goal must not continue itself");
+	});
+
+	it("lets an interrupt pause before the aborted turn can exhaust the no-progress budget", async () => {
+		const harness = createHarness();
+		await startGoal(harness);
+		await markInitialTurnRunning(harness);
+		await harness.settle();
+		assert.equal(harness.sentMessages.length, 3);
+		await markLatestGoalTurnRunning(harness);
+
+		const unchanged = {
+			role: "assistant",
+			content: [{ type: "text", text: "still waiting" }],
+			usage: { output: 1 },
+		};
+		for (let turn = 0; turn < 3; turn += 1) {
+			await harness.emit("turn_end", { type: "turn_end", message: unchanged, toolResults: [] });
+		}
+		assert.equal(latestSnapshot(harness).budgetUsage.noProgressTurns, 2);
+
+		const interrupted = {
+			role: "assistant",
+			content: [],
+			stopReason: "aborted",
+			usage: { output: 0 },
+		};
+		await harness.emit("turn_end", { type: "turn_end", message: interrupted, toolResults: [] });
+		const messages = harness.branch.flatMap((entry) =>
+			entry.type === "message" ? [record(entry.message)] : [],
+		);
+		await harness.emit("agent_end", { type: "agent_end", messages: [...messages, interrupted] });
+		await harness.emit("agent_settled", { type: "agent_settled" });
+
+		const snapshot = latestSnapshot(harness);
+		assert.equal(snapshot.phase, "paused");
+		assert.equal(snapshot.budgetUsage.automaticTurns, 3);
+		assert.equal(snapshot.budgetUsage.noProgressTurns, 2);
+		assert.equal(harness.sentMessages.length, 3);
+	});
+
+	it("does not let an uncorrelated abort bypass continuation identity", async () => {
+		const harness = createHarness();
+		await startGoal(harness);
+		await markInitialTurnRunning(harness);
+		const interrupted = {
+			role: "assistant",
+			content: [],
+			stopReason: "aborted",
+			usage: { output: 0 },
+		};
+		await harness.emit("turn_end", {
+			type: "turn_end",
+			message: interrupted,
+			toolResults: [],
+		});
+		await harness.emit("agent_end", { type: "agent_end", messages: [interrupted] });
+		await harness.emit("agent_settled", { type: "agent_settled" });
+
+		const snapshot = latestSnapshot(harness);
+		assert.equal(snapshot.phase, "faulted");
+		assert.match(snapshot.faultReason ?? "", /continuation nonce/u);
+		assert.equal(harness.sentMessages.length, 2);
 	});
 
 	it("queues exactly one continuation when terminal output arrives before settlement", async () => {

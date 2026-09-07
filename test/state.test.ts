@@ -404,6 +404,89 @@ describe("finite budgets", () => {
 		assert.equal(target.reserveContinuation(NOW + 8), undefined);
 	});
 
+	it("increases exhausted budgets without silently resuming the goal", () => {
+		const target = machine({ maxAutomaticTurns: 1, maxNoProgressTurns: 10 });
+		const initial = target.queueInitialContinuation(NOW + 1);
+		target.agentStarted(NOW + 2, initial.nonce);
+		settleParent(target, NOW + 3);
+		const ticket = target.snapshot.continuation?.ticket;
+		assert.ok(ticket);
+		target.commitContinuation(ticket, NOW + 4);
+		target.agentStarted(NOW + 5, ticket.nonce);
+		target.recordTurn({ tokens: 1, progressSignature: "progress", now: NOW + 6 });
+		assert.equal(target.snapshot.phase, "budget_exhausted");
+		assert.match(target.snapshot.pauseReason ?? "", /automatic turns/u);
+
+		const limits = target.increaseBudget({ automaticTurns: 2 }, NOW + 7);
+		assert.equal(limits.maxAutomaticTurns, 3);
+		assert.equal(target.snapshot.phase, "paused");
+		assert.match(target.snapshot.pauseReason ?? "", /explicit \/goal resume/u);
+		assert.equal(target.snapshot.continuation, undefined);
+		assert.doesNotThrow(() => new GoalMachine(target.snapshot));
+		assert.equal(target.resume(NOW + 8), true);
+	});
+
+	it("extends finite token and wall-clock budgets through the state-machine API", () => {
+		const tokenTarget = machine({ maxTokens: 5 });
+		tokenTarget.recordExternalTokens(5, NOW + 1);
+		assert.equal(tokenTarget.snapshot.phase, "budget_exhausted");
+		tokenTarget.increaseBudget({ tokens: 5 }, NOW + 2);
+		assert.equal(tokenTarget.snapshot.budgetLimits.maxTokens, 10);
+		assert.equal(tokenTarget.snapshot.phase, "paused");
+
+		const wallTarget = machine({ maxWallClockMs: 5 });
+		assert.equal(wallTarget.reserveContinuation(NOW + 5), undefined);
+		assert.equal(wallTarget.snapshot.phase, "budget_exhausted");
+		wallTarget.increaseBudget({ wallClockMs: 10 }, NOW + 6);
+		assert.equal(wallTarget.snapshot.budgetLimits.maxWallClockMs, 15);
+		assert.equal(wallTarget.snapshot.phase, "paused");
+	});
+
+	it("re-evaluates active budgets that expired while the goal was idle", () => {
+		const stillExpired = machine({ maxWallClockMs: 5 });
+		stillExpired.increaseBudget({ automaticTurns: 1 }, NOW + 6);
+		assert.equal(stillExpired.snapshot.phase, "budget_exhausted");
+		assert.match(stillExpired.snapshot.pauseReason ?? "", /wall-clock time/u);
+
+		const extended = machine({ maxWallClockMs: 5 });
+		extended.increaseBudget({ wallClockMs: 10 }, NOW + 6);
+		assert.equal(extended.snapshot.phase, "paused");
+		assert.match(extended.snapshot.pauseReason ?? "", /explicit \/goal resume/u);
+	});
+
+	it("preserves budget evidence when an interruption overrides exhaustion", () => {
+		const target = machine({ maxTokens: 1 });
+		target.recordExternalTokens(1, NOW + 1);
+		assert.equal(target.snapshot.phase, "budget_exhausted");
+		assert.equal(target.interrupt("Parent turn interrupted.", NOW + 2), true);
+		assert.equal(target.snapshot.phase, "paused");
+		assert.match(target.snapshot.pauseReason ?? "", /tokens/u);
+		assert.equal(target.resume(NOW + 3), false);
+		assert.equal(target.snapshot.phase, "budget_exhausted");
+	});
+
+	it("requires the user to increase every exhausted budget dimension", () => {
+		const target = machine({ maxAutomaticTurns: 10, maxNoProgressTurns: 1 });
+		const initial = target.queueInitialContinuation(NOW + 1);
+		target.agentStarted(NOW + 2, initial.nonce);
+		settleParent(target, NOW + 3);
+		const ticket = target.snapshot.continuation?.ticket;
+		assert.ok(ticket);
+		target.commitContinuation(ticket, NOW + 4);
+		target.agentStarted(NOW + 5, ticket.nonce);
+		target.recordTurn({ tokens: 1, progressSignature: "same", now: NOW + 6 });
+		target.recordTurn({ tokens: 1, progressSignature: "same", now: NOW + 7 });
+		assert.equal(target.snapshot.phase, "budget_exhausted");
+
+		target.increaseBudget({ automaticTurns: 1 }, NOW + 8);
+		assert.equal(target.snapshot.phase, "budget_exhausted");
+		assert.match(target.snapshot.pauseReason ?? "", /unchanged turns/u);
+		target.increaseBudget({ noProgressTurns: 2 }, NOW + 9);
+		assert.equal(target.snapshot.phase, "paused");
+		assert.throws(() => target.increaseBudget({ automaticTurns: 0 }, NOW + 10), />= 1/u);
+		assert.throws(() => target.increaseBudget({ tokens: 1 }, NOW + 10), /unlimited/u);
+	});
+
 	it("saturates parent and external token accounting before persistence-safe overflow", () => {
 		const target = machine({ maxTokens: Number.MAX_SAFE_INTEGER - 1 });
 		target.recordTurn({
@@ -420,6 +503,31 @@ describe("finite budgets", () => {
 		assert.equal(external.snapshot.budgetUsage.tokens, Number.MAX_SAFE_INTEGER);
 		assert.equal(external.snapshot.phase, "budget_exhausted");
 		assert.doesNotThrow(() => new GoalMachine(external.snapshot));
+
+		const counters = machine({
+			maxAutomaticTurns: Number.MAX_SAFE_INTEGER,
+			maxNoProgressTurns: Number.MAX_SAFE_INTEGER,
+		});
+		const initial = counters.queueInitialContinuation(NOW + 1);
+		counters.agentStarted(NOW + 2, initial.nonce);
+		settleParent(counters, NOW + 3);
+		const ticket = counters.snapshot.continuation?.ticket;
+		assert.ok(ticket);
+		counters.commitContinuation(ticket, NOW + 4);
+		counters.agentStarted(NOW + 5, ticket.nonce);
+		const nearLimit = counters.snapshot;
+		nearLimit.budgetUsage = {
+			automaticTurns: Number.MAX_SAFE_INTEGER - 1,
+			tokens: 0,
+			noProgressTurns: Number.MAX_SAFE_INTEGER - 1,
+			lastProgressSignature: "same",
+		};
+		const restored = new GoalMachine(nearLimit);
+		restored.recordTurn({ tokens: 0, progressSignature: "same", now: NOW + 6 });
+		assert.equal(restored.snapshot.budgetUsage.automaticTurns, Number.MAX_SAFE_INTEGER);
+		assert.equal(restored.snapshot.budgetUsage.noProgressTurns, Number.MAX_SAFE_INTEGER);
+		assert.equal(restored.snapshot.phase, "budget_exhausted");
+		assert.doesNotThrow(() => new GoalMachine(restored.snapshot));
 	});
 
 	it("enforces token, wall-clock, and no-progress limits", () => {
