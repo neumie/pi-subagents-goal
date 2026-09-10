@@ -2,7 +2,7 @@
 
 ## Scope
 
-This model covers the autonomous parent loop on Pi `0.83.0` and, when explicitly used, optional goal-owned coordination with `pi-subagents` `0.38.1`. The core loop does not require `pi-subagents`. It does not sandbox agents or make model output trustworthy.
+This model covers the autonomous parent loop on Pi `0.83.0` and exact `0.85.1`, and the disabled goal-owned integration boundary against official `pi-subagents` main `0.67.0`; the dormant legacy transport is historical test coverage, not a supported provider invocation path. The core loop does not require `pi-subagents`; ordinary subagent calls remain outside this extension's ownership. It does not sandbox agents or make model output trustworthy.
 
 ## Assets
 
@@ -18,7 +18,7 @@ This model covers the autonomous parent loop on Pi `0.83.0` and, when explicitly
 
 1. Pi's in-process extension event bus delivers JavaScript values without transport corruption.
 2. Pi's active `SessionManager` reports the correct session ID, file, and active branch.
-3. When a goal-owned subagent tool is used, `pi-subagents` delegation V2 emits one caller-correlated terminal response for foreground requests or the local timeout/abort path fires.
+3. Historical delegation V2 assumed one caller-correlated terminal response for foreground requests, or a local timeout/abort. This assumption applies only to the dormant legacy transport: current goal-owned tools reject before provider dispatch. A timeout/abort alone does not establish process or side-effect termination.
 4. The filesystem, Pi process, and installed extension source are controlled by the local user.
 5. SHA-256 is sufficient for integrity/deduplication digests; it is not used to encrypt values.
 6. Random UUID/token generation from Node `crypto` is unpredictable enough for same-process correlation.
@@ -57,13 +57,13 @@ A malicious extension loaded into the same Pi process is inside the trust bounda
 | Child output omitted from context | `pending_surface` blocks consumption; output-bearing continuation or goal tool result must mark `surfaced` |
 | Model invents acknowledgement | Timing-safe comparison with a random exact token and item ID |
 | Failure treated as success | Terminal state is immutable; `goal_resolve` records rationale but does not rewrite outcome |
-| Optional provider is absent | Core startup and `goal_done` never probe it; only `goal_subagent` or `goal_review` returns an actionable compatibility error |
+| Optional provider is absent or unsupported | Core startup and `goal_done` never probe it; `goal_subagent` and `goal_review` reject after identity validation, before admission or dispatch, with a bounded hard-turn compatibility error |
 | Installed ordinary subagent bypasses ledger | Allowed and documented as unowned; only `message_start` for the exact owner/ticket/content-bound custom continuation or an exact nonce-tagged prompt can start the queued goal turn, and the same nonce must be present at end; preceding foreign turns remain excluded from goal budget and settlement state |
 | Current goal-owned detached completion races extension | `goal_subagent execution=detached` is rejected before admission |
 | Fork inherits authority | Exact session ID/file validation; switch/fork/tree blocked while live |
 | Unsafe compaction removes evidence | Compaction blocked with nonterminal work or unconsumed output |
 | Reload loses foreground child | Restore with a nonterminal child faults |
-| Unlimited autonomy | Parent automatic-turn/no-progress and child timeout/turn budgets remain finite by default; token and wall-clock caps are explicitly optional |
+| Unlimited autonomy | Parent automatic-turn/no-progress limits remain finite; new owned launches are disabled rather than dropping required child limits. Token and wall-clock caps are explicitly optional |
 | Budget silently expands or restarts work | Only an explicit user command/state-machine call can add a positive bounded delta; overflow is rejected; exhausted goals recover to paused and require explicit resume |
 | Wrong budget increase bypasses another guard | Exhausted dimensions are recomputed after mutation; the goal remains exhausted until every exceeded limit is extended |
 | Pre-existing context exhausts a goal cap | Parent accounting uses newly generated output only; delegated terminal usage is added before continuation eligibility, including while paused/cancelling |
@@ -82,9 +82,9 @@ Acknowledgement tokens are capabilities, not authentication against hostile same
 
 Child output is bounded to 40,000 UTF-8 bytes per retained runner result, and every complete model-facing aggregate is bounded to 48,000 UTF-8 bytes including objective/framing/tokens. Truncation preserves Unicode boundaries and is explicit. A reviewer that needs omitted detail must inspect the configured child session/output through normal Pi interfaces before passing review.
 
-## Optional independent review limitations
+## Historical independent review limitations
 
-The advisory review can improve process independence but cannot prove semantic correctness and is not a completion gate:
+New `goal_review` execution is unavailable in this candidate. For historical records, the advisory review can improve process independence but cannot prove semantic correctness and is not a completion gate:
 
 - the reviewer is still a model;
 - it reads the same local repository and may share provider/model biases;
@@ -101,8 +101,8 @@ The prompt makes the reviewer read-only and asks for source-backed findings. Ope
 4. **Usage accuracy.** Explicit token caps rely on Pi parent-output and `pi-subagents` usage reports. Missing usage counts as zero. Token and wall-clock caps are disabled by default; automatic-turn/no-progress and child limits remain independent backstops.
 5. **Model-facing output bounds.** Preview truncation may require manual/session inspection before a truthful acknowledgement.
 6. **Clean-shutdown semantics.** A clean shutdown pauses and permits explicit resume because Pi is expected to abort the active turn. If the host violates that assumption, a user should cancel rather than resume.
-7. **Unowned ordinary subagents.** When that tool is installed, ordinary `subagent` calls retain upstream behavior and may schedule their own completion turns. The goal loop does not track, acknowledge, wait for, or make completion claims about that work; use `goal_subagent` when those guarantees matter.
-8. **Optional upstream availability.** The integration smoke pins a sibling checkout and requires a clean worktree, but the core goal loop remains usable when it is absent. `PI_SUBAGENTS_LOCAL_PATH` can select an equivalent clean checkout for integration verification.
+7. **Unowned ordinary subagents.** When that tool is installed, ordinary `subagent` calls retain upstream behavior and may schedule their own completion turns. The goal loop does not track, acknowledge, wait for, or make completion claims about that work. Goal-owned helpers are disabled in this upstream-compatible release rather than weakening their hard-turn guarantee.
+8. **Upstream compatibility boundary.** The core goal loop remains usable without pi-subagents. This release does not enable goal-owned helpers against an upstream provider that lacks enforced child-turn limits; no provider installation can silently re-enable them.
 9. **Pi shrinkwrap advisory.** Pi 0.83.0 publishes a shrinkwrapped `brace-expansion@5.0.7`, affected by `GHSA-mh99-v99m-4gvg` (high-severity memory-exhaustion DoS). Clean-install testing shows root overrides and `npm audit fix` do not replace it. This extension does not accept brace/minimatch patterns and does not bundle that package, but a clean host Pi package installation retains the risk. Remediation requires a Pi release whose published shrinkwrap selects `brace-expansion>=5.0.8`.
 10. **Same-process object enumeration.** Structured terminal arrays validate length and inspect only JSON-indexed own descriptors; named/symbol array properties are ignored without key enumeration. A malicious same-process ordinary object can still make key enumeration allocate before its keys are rejected; JavaScript proxies/objects are inside the documented in-process trust boundary, so this residual cannot be eliminated without an isolation boundary.
 

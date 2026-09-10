@@ -1,12 +1,11 @@
-# Required upstream coordination hook
+# Upstream compatibility and historical coordination design
 
 ## Audited versions
 
-- Pi: `@earendil-works/pi-coding-agent` `0.83.0`
-- local `pi-subagents`: `0.38.1`
-- local commit: `886bbad929134d7954a4fb34e532d82ac21e33e8`
+- Pi: `@earendil-works/pi-coding-agent` `0.83.0` (pinned development target) and exact `0.85.1` (production-loader/direct-lifecycle check with a deterministic stream on Node `24.18.0`; not interactive TUI or real-model evidence)
+- official `pi-subagents` main: `0.67.0` (upstream compatibility target)
 
-The repository was inspected read-only. No upstream or global Pi files are modified by this project. This contract applies only when the parent opts into `goal_subagent` or `goal_review`; the core goal loop does not probe or require `pi-subagents`, and ordinary `subagent` calls, when the tool is installed, remain upstream-owned and unrestricted.
+The repository was inspected read-only. No upstream or global Pi files are modified by this project. In the upstream-compatible release, `goal_subagent` and `goal_review` reject before ledger admission or provider dispatch because official `pi-subagents` does not enforce the hard child-turn limits required by this extension. The direct goal loop does not probe or require `pi-subagents`, and ordinary `subagent` calls, when installed, remain upstream-owned and subject to their own upstream controls.
 
 ## Why current goal-owned detached work is rejected
 
@@ -40,25 +39,11 @@ Therefore a downstream observer cannot:
 
 The RPC `spawn` method does not fix this. It starts detached work but does not transfer completion/notification ownership to the caller.
 
-## What works today
+## Current upstream-compatible behavior
 
-Foreground delegation V2 uses these established channels from `src/api/delegation.ts`:
+The upstream provider's structured delegation contract is unversioned and deliberately rejects the `version` and `turnBudget` fields used by the historical goal-owned bridge. More importantly, upstream no longer enforces the hard child-turn limits required by this extension. Therefore this release does **not** launch goal-owned foreground, parallel, chain, or review work: both tools reject after goal/session identity validation and before ledger admission, provider probing, generation changes, or dispatch.
 
-```text
-prompt-template:subagent:request
-prompt-template:subagent:started
-prompt-template:subagent:update
-prompt-template:subagent:response
-prompt-template:subagent:cancel
-```
-
-V2 adds `ownerRunId` and `nodeId`. `pi-subagents-goal` additionally correlates the generated request ID, so the accepted tuple is:
-
-```text
-protocol version + request ID + ownerRunId + nodeId
-```
-
-The caller waits for the terminal response and remains the only component deciding whether to enqueue another parent turn. That is why optional goal-owned single, parallel, chain, and review foreground paths are supported.
+Direct-only goals remain supported without `pi-subagents`. Ordinary `subagent` calls remain upstream-owned and are not tracked by this extension. The dormant V2 bridge and its tests are retained as historical internal coverage only; they do not establish current upstream interoperability.
 
 ## Existing RPC evidence
 
@@ -70,25 +55,13 @@ ping, status, spawn, steer, interrupt, stop, resume
 
 `ping` reports session identity plus async/process-terminal observer event names. It does **not** advertise caller-owned goal coordination. Fleet status identities are intentionally opaque and cannot substitute for immutable goal/item ownership.
 
-The real-local smoke verifies:
+The historical local smoke record is not current-upstream compatibility evidence. It exercised a prior audited local revision and is retained only to document the old bridge behavior; it did not authorize enabling the goal-owned tools against upstream 0.67.0.
 
-```json
-{
-  "piSubagentsVersion": "0.38.1",
-  "piSubagentsCommit": "886bbad929134d7954a4fb34e532d82ac21e33e8",
-  "localWorktreeClean": true,
-  "rpcSessionMatched": true,
-  "delegationV2TupleMatched": true,
-  "foregroundTerminal": "failed",
-  "detachedGoalCoordinationAdvertised": false
-}
-```
+## Historical proposal: coordinated `pi-subagents` contract
 
-The foreground terminal is deliberately `failed` with `Unknown agent`; this proves the real V2 request/start/response path and exact tuple without invoking a model.
+The following proposal is retained as design history, not a requirement for this migration or an implemented auto-enablement path. Any future goal-owned runtime change requires separate review and enforcement of the required child limits.
 
-## Minimal `pi-subagents` contract
-
-A future version can advertise the following from RPC `ping`:
+The proposal would advertise the following from RPC `ping`:
 
 ```json
 {
@@ -234,11 +207,11 @@ Required semantics:
 
 An equivalent reserve/commit/lookup API is acceptable if it gives the same atomicity and idempotent recovery.
 
-## Adoption rule in this extension
+## Historical adoption rule — not current runtime behavior
 
-Detached mode remains rejected until **both** are true:
+The earlier proposal required **both** conditions below. Current goal-owned tools reject unconditionally; advertising these capabilities cannot re-enable them:
 
 1. `pi-subagents` advertises and satisfies `goalCoordination v1` with caller-owned notification, replay, cancellation, and output acknowledgement;
 2. Pi offers an atomic/idempotent continuation enqueue or another mechanism proving exactly-one recovery.
 
-Unknown versions, partial capabilities, malformed channels, mismatched sessions, or missing methods fail closed for the optional goal-owned adapter. The parent loop and ordinary tools remain available; optional goal-owned foreground delegation is the supported coordinated path in the meantime.
+Unknown versions, partial capabilities, malformed channels, mismatched sessions, or missing methods fail closed for the historical goal-owned adapter. The parent loop and ordinary tools remain available; goal-owned foreground delegation and review are disabled in the upstream-compatible release rather than silently weakening hard child-turn guarantees.

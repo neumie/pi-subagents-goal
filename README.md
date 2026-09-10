@@ -2,9 +2,9 @@
 
 An autonomous goal loop for [Pi](https://github.com/badlogic/pi-mono) with optional, fail-closed coordination for goal-owned `pi-subagents` work.
 
-The extension owns `/goal` and schedules continuation turns while the parent works directly with any ordinary tools. `pi-subagents`, `goal_subagent`, and independent review are optional; strict lifecycle, acknowledgement, and resolution gates apply only to work explicitly launched through the goal-owned tools.
+The extension owns `/goal` and schedules continuation turns while the parent works directly with any ordinary tools. `pi-subagents` and ordinary `subagent` calls are optional and unowned. Goal-owned launch/review tools remain registered for namespace stability but are unavailable in this release; strict lifecycle, acknowledgement, and resolution gates apply only to historical owned records.
 
-> **Compatibility:** the core goal loop targets exactly Pi `0.83.0`, `typebox` `1.3.7`, and Node `>=22.19.0`. Optional goal-owned delegation targets `pi-subagents` `0.38.1` at audited commit `886bbad929134d7954a4fb34e532d82ac21e33e8`.
+> **Compatibility:** development checks remain pinned to Pi `0.83.0`; exact Pi `0.85.1` is also supported, with `typebox` `1.3.7` and Node `>=22.19.0`. On Node `24.18.0`, a deterministic print-mode check loaded production goal and official `pi-subagents` `0.67.0` together, exercised native RPC ping/status, rejected both owned helpers without provider requests or ledger changes, and completed a direct goal. This is not interactive-TUI or real-model inference evidence. This upstream-compatible candidate keeps goal-owned delegation and review disabled because official `pi-subagents` no longer enforces the required hard child-turn limits.
 
 ## Status
 
@@ -12,30 +12,26 @@ The extension owns `/goal` and schedules continuation turns while the parent wor
 | --- | --- |
 | Direct work with ordinary Pi tools | Supported; default path |
 | Ordinary `subagent` calls, when that tool is installed | Supported; outside the goal-owned ledger |
-| Goal-owned single/parallel/chain delegation | Optional through delegation V2 |
-| Structured independent review | Optional advisory evidence |
+| Goal-owned single/parallel/chain delegation | Unavailable; rejected before admission/provider dispatch |
+| Structured independent review | Unavailable; historical records remain advisory |
 | Goal-owned detached/background delegation | Rejected fail-closed on current upstream |
 | Session switch/fork/tree during a live goal | Blocked |
 | Compaction with active or unread goal-owned work | Blocked |
 | Reload with ambiguous goal-owned work/continuation state | Faulted, never retried automatically |
 
-Only detached work launched through `goal_subagent` is intentionally unavailable. When installed, ordinary `subagent` remains untouched and follows its own upstream lifecycle outside this extension's guarantees. `pi-subagents` currently queues its own detached completion turn before publishing its observer event, so the optional goal-owned adapter cannot safely become sole continuation owner. See [`docs/UPSTREAM-INTEGRATION.md`](docs/UPSTREAM-INTEGRATION.md).
+Goal-owned delegation and review are intentionally unavailable in this release. They reject before ledger admission or provider dispatch, preserving the documented hard-limit guarantee. When installed, ordinary `subagent` remains untouched and follows its own upstream lifecycle outside this extension's guarantees. Direct goals remain fully available without `pi-subagents`. See [`docs/UPSTREAM-INTEGRATION.md`](docs/UPSTREAM-INTEGRATION.md).
 
 ## Installation
 
-Install the goal loop through Pi; it works without `pi-subagents`:
+The migration described here is an unreleased review-branch change, not part of the existing `v0.2.2` tag. The command below installs that prior tagged version, **not this candidate**. Installing or activating the candidate requires a separately reviewed Git revision.
+
+Install the prior tagged goal loop through Pi; it works without `pi-subagents`:
 
 ```bash
 pi install git:github.com/neumie/pi-subagents-goal@v0.2.2
 ```
 
-Optionally install the audited [`pi-subagents`](https://github.com/neumie/pi-subagents) revision to enable `goal_subagent` and `goal_review`:
-
-```bash
-pi install git:github.com/neumie/pi-subagents@886bbad929134d7954a4fb34e532d82ac21e33e8
-```
-
-An unpinned `git:github.com/neumie/pi-subagents-goal@main` install is for development only; use the immutable release tag above for normal installation.
+`pi-subagents` is not required for direct goals. This release does not enable `goal_subagent` or `goal_review`; no compatible provider installation can re-enable them silently.
 
 For development from a local checkout:
 
@@ -75,10 +71,10 @@ Starting a goal appends a digest-bound objective message and a value-free state 
 
 ### Goal-owned tools
 
-- **`goal_subagent`** — optional foreground single, parallel, or chain delegation with exact goal ownership. When installed, ordinary `subagent` remains available and untracked by the goal ledger.
+- **`goal_subagent`** — registered for namespace stability but unavailable in this release; it rejects before ledger admission because upstream does not enforce the required hard child-turn limits. Ordinary `subagent` remains available and untracked by the goal ledger.
 - **`goal_ack_output`** — consumes output from `goal_subagent` or `goal_review` using its exact one-time acknowledgement token plus a non-empty consideration statement.
 - **`goal_resolve`** — records an explicit rationale for an acknowledged unsuccessful goal-owned outcome. It never rewrites failure as success.
-- **`goal_review`** — optionally launches a read-only structured reviewer after prior goal-owned work is terminal, consumed, and resolved. Its verdict is advisory rather than a completion gate.
+- **`goal_review`** — registered for namespace stability but unavailable in this release for the same hard child-turn-limit reason. Direct goals do not require independent review.
 - **`goal_done`** — completes when enabled budgets remain and every goal-owned item, if any, is included, terminal, consumed, and explicitly resolved when unsuccessful. No subagent or review is required.
 
 Every continuation repeats the exact goal ID and epoch so the parent never needs to inspect environment variables, session artifacts, or ambient process state. A direct-only goal calls `goal_done` with an empty `consideredItemIds` list. If optional goal-owned tools are used, their exact item IDs and acknowledgement lifecycle remain mandatory.
@@ -87,18 +83,12 @@ Every continuation repeats the exact goal ID and epoch so the parent never needs
 
 Version 0.2 removes mandatory delegation and review. `goal_done.reviewToken` is accepted as an optional deprecated field and ignored so 0.1-era calls do not fail schema validation; new callers should omit it. Model-facing goal tool-result details are version 2. The display-safe status DTO remains version 1 because its shape is unchanged; `review` is advisory, so `phase: "completed"` may now coexist with `review: "fail"`.
 
-Example foreground call shape:
+Historical foreground call shape (not supported by this release; retained only for record compatibility):
 
 ```json
 {
-  "goalId": "<current goal id>",
-  "epoch": 1,
-  "tasks": [
-    { "agent": "worker", "task": "Implement the narrow change" },
-    { "agent": "reviewer", "task": "Inspect compatibility assumptions" }
-  ],
-  "concurrency": 2,
-  "context": "fresh"
+  "goalId": "<historical goal id>", "epoch": 1,
+  "tasks": [{ "agent": "worker", "task": "Historical work record" }]
 }
 ```
 
@@ -160,12 +150,11 @@ npm pack --dry-run
 PI_GOAL_GIT_SMOKE_REPOSITORY=owner/repository PI_GOAL_GIT_SMOKE_REF=<40-char-sha> npm run test:smoke:git
 ```
 
-`test:smoke` performs two bounded checks without invoking a model:
+`test:smoke` performs the current bounded loader check without invoking a model:
 
-1. loads the extension with Pi `0.83.0`'s real Jiti loader and verifies its registered surface;
-2. loads the real local `pi-subagents` checkout, proves exact-session RPC and delegation V2 tuple correlation using an intentionally unknown agent, and proves detached coordination is not advertised.
+1. loads the extension with Pi `0.83.0`'s real Jiti loader and verifies its registered surface.
 
-Hosted CI uses Node `22.19.0` to run the locked install, full quality gate, and the first check through `test:smoke:pi`. The second check intentionally remains local because it requires the separately audited checkout identified in `test/smoke/local-pi-subagents-smoke.ts`.
+`test:smoke:legacy` is a historical smoke for the retired audited provider checkout; it is not evidence of current upstream interoperability. Hosted CI runs only the current loader check.
 
 ### Known upstream audit residual
 

@@ -8,6 +8,7 @@ import { loadExtensions } from "../../node_modules/@earendil-works/pi-coding-age
 import { SessionManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/session-manager.js";
 import { SubagentBridge } from "../../src/subagents-bridge.ts";
 
+// Historical compatibility smoke for the retired audited provider; not current-upstream interoperability evidence.
 const EXPECTED_LOCAL_VERSION = "0.38.1";
 const EXPECTED_LOCAL_COMMIT = "886bbad929134d7954a4fb34e532d82ac21e33e8";
 const projectRoot = resolve(import.meta.dirname, "../..");

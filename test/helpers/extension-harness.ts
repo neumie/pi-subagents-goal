@@ -66,7 +66,8 @@ export interface HarnessOptions {
 	preexistingGoalCommand?: boolean;
 	preexistingGoalTool?: string;
 	sendMessageFailureAt?: number;
-	provider?: ProviderHandler;
+	/** null models the provider being unavailable; no delegation listener is installed. */
+	provider?: ProviderHandler | null;
 }
 
 export interface Harness {
@@ -83,6 +84,7 @@ export interface Harness {
 	replaceBranch(entries?: Array<Record<string, unknown>>): void;
 	abortCount: () => number;
 	rpcRequestCount: () => number;
+	providerRequestCount: () => number;
 	emit(name: string, event: Record<string, unknown>): Promise<unknown[]>;
 	start(reason?: "startup" | "resume" | "switch" | "fork" | "tree"): Promise<void>;
 	settle(): Promise<void>;
@@ -157,6 +159,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	let toolSequence = 0;
 	let sendAttempts = 0;
 	let rpcRequests = 0;
+	let providerRequests = 0;
 	let activeController: AbortController | undefined;
 
 	if (options.preexistingGoalCommand) {
@@ -246,11 +249,14 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		});
 	});
 
-	const provider = options.provider ?? defaultProvider();
-	events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
-		const request = record(raw);
-		if (request) provider(request, events);
-	});
+	if (options.provider !== null) {
+		const provider = options.provider ?? defaultProvider();
+		events.on(SUBAGENT_DELEGATION_REQUEST, (raw) => {
+			providerRequests += 1;
+			const request = record(raw);
+			if (request) provider(request, events);
+		});
+	}
 
 	const emit = async (name: string, event: Record<string, unknown>) => {
 		const results: unknown[] = [];
@@ -282,6 +288,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		},
 		abortCount: () => aborts,
 		rpcRequestCount: () => rpcRequests,
+		providerRequestCount: () => providerRequests,
 		emit,
 		start: async (reason = "startup") => {
 			await emit("session_start", { type: "session_start", reason });

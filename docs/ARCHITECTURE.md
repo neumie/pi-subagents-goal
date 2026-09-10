@@ -2,6 +2,8 @@
 
 ## Design objective
 
+The current candidate supports direct goals only. Owned-work sections below describe historical ledger behavior and dormant implementation, not available new launches.
+
 `pi-subagents-goal` runs an autonomous parent loop that may work entirely through ordinary Pi tools. When the parent explicitly opts into goal-owned child work, the loop continues only after every owned child is terminal and its output can be surfaced exactly once for consideration. It never treats silence, process exit, or an uncorrelated event as completion evidence for that optional owned work.
 
 The implementation is intentionally split into three deep modules and one thin Pi adapter.
@@ -40,9 +42,9 @@ It does not inspect `.pi-subagents` artifacts or poll ambient process state. The
 
 ### `GoalSubagentRunner` — `src/foreground-runner.ts`
 
-The runner translates optional single, parallel, chain, and review calls into ledger admissions plus delegation V2 requests. The core parent loop does not probe or invoke the provider unless a goal-owned subagent tool is called.
+This dormant legacy runner translates single, parallel, chain, and review calls into ledger admissions plus delegation V2 requests. The current extension never constructs or invokes it: both goal-owned tools reject before probing, admission, or provider dispatch.
 
-Important ordering:
+Historical runner ordering:
 
 1. admit every parallel/chain item before starting any child;
 2. emit the exact `ownerRunId`/`nodeId` tuple;
@@ -57,12 +59,12 @@ Parallel concurrency is bounded at four. Chains replace `{previous}` with the pr
 
 ### Pi adapter — `src/extension.ts`
 
-The adapter owns side effects:
+The adapter owns side effects (the current upstream release rejects new owned provider invocation before dispatch):
 
 - one `/goal` command with discoverable status, pause, resume, stop, and budget controls;
 - automatic conversion of an aborted tracked parent turn into a durable pause;
 - five optional `goal_*` coordination tools;
-- lazy `pi-subagents` compatibility probing only when `goal_subagent` or `goal_review` is called;
+- goal-owned tools retained for namespace stability but rejected after identity validation because official upstream lacks the required hard child-turn limits;
 - session-native persistence;
 - lifecycle guards and recovery;
 - namespace verification after Pi binds runtime actions;
@@ -163,9 +165,9 @@ The runner caches terminal output before its state-change callback, so the secon
 
 ## Completion and optional review
 
-A goal with no goal-owned work can complete directly with `goal_done` and an empty `consideredItemIds` list. If `goal_subagent` or `goal_review` was used, completion still requires every admitted item to be terminal, surfaced, consumed, explicitly resolved when unsuccessful, and included exactly once in `consideredItemIds`.
+A goal completes directly with `goal_done` and an empty `consideredItemIds` list. In the upstream-compatible release, `goal_subagent` and `goal_review` reject before admission, so no new goal-owned items can be created. Historical terminal ledger items remain subject to the normal acknowledgement and resolution rules.
 
-`goal_review` is optional advisory evidence. It is itself a ledger item with role `review` and is admitted only after existing goal-owned work is terminal, consumed, and resolved. The child must return a schema-valid object:
+Historical goal-review records remain advisory evidence and are handled by the normal ledger rules. New `goal_review` execution is disabled because upstream does not enforce the hard child-turn limits required by this extension. The child result schema remains documented for historical records:
 
 ```json
 {
@@ -226,8 +228,8 @@ The display-safe payload includes objective, phase, timestamps, work aggregates,
 
 ## Supported and unsupported coordination
 
-When an ordinary `subagent` tool is installed, its use is allowed and retains its upstream behavior; it is deliberately outside goal ownership, acknowledgement, and completion checks.
+When an ordinary `subagent` tool is installed, its use is allowed and retains its upstream behavior; it is deliberately outside goal ownership, acknowledgement, and completion checks. The dormant legacy transport is not a supported provider invocation path.
 
-Optional goal-owned foreground delegation V2 is supported because the caller owns the request lifetime and receives the terminal response before deciding whether to continue.
+Goal-owned foreground and review execution are disabled in this upstream-compatible release. The historical V2 bridge remains internal test coverage only; official upstream rejects its versioned envelope and no longer enforces the hard child-turn limits required by this extension. The tools reject before ledger admission or provider dispatch. Ordinary `subagent` remains available outside goal ownership, and direct-only goals do not require it.
 
-Current goal-owned detached RPC `spawn` is unsupported because `pi-subagents` owns its notification turn. The bridge contains a versioned future client, but the Pi adapter rejects detached requests even if only the provider capability appears: Pi also needs an atomic caller-owned enqueue/acknowledgement primitive. The exact proposal is in [`UPSTREAM-INTEGRATION.md`](UPSTREAM-INTEGRATION.md).
+Goal-owned detached execution remains unavailable. The detailed upstream compatibility boundary and any future coordination proposal are documented in [`UPSTREAM-INTEGRATION.md`](UPSTREAM-INTEGRATION.md).

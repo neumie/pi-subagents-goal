@@ -9,7 +9,6 @@ import type {
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import { GoalSubagentRunner, type GoalSubagentParams } from "./foreground-runner.ts";
 import { GOAL_LIMITS } from "./limits.ts";
 import {
 	GOAL_CONTINUATION_MESSAGE,
@@ -28,7 +27,7 @@ import {
 	isGoalStatusRequest,
 	type GoalStatusEnvelope,
 } from "./status-api.ts";
-import { SubagentBridge, SubagentBridgeError, type SubagentCompatibility } from "./subagents-bridge.ts";
+import { SubagentBridge } from "./subagents-bridge.ts";
 import { MAX_MODEL_TEXT_BYTES, equalPreviewByteLimit, truncateUtf8, utf8ByteLength } from "./text-budget.ts";
 import {
 	GoalInvariantError,
@@ -388,17 +387,23 @@ function assertGoalIdentity(machine: GoalMachine, goalId: string, epoch: number)
 	}
 }
 
+const GOAL_OWNED_WORK_UNAVAILABLE =
+	"Goal-owned subagent work and review are unavailable with the official pi-subagents provider: it does not enforce the hard child-turn limits required by this goal contract. Use ordinary subagent work outside the goal ledger, or continue directly with ordinary tools.";
+
+function rejectGoalOwnedWork(): never {
+	throw new GoalInvariantError(GOAL_OWNED_WORK_UNAVAILABLE);
+}
+
 function extensionSystemPrompt(objective: string, snapshot: GoalSnapshot): string {
 	return [
 		"PI GOAL MODE IS ACTIVE.",
 		`Goal ID: ${snapshot.owner.goalId}`,
 		`Goal epoch: ${snapshot.owner.epoch}`,
 		`Objective: ${objective}`,
-		"Work directly with ordinary tools whenever useful. Both pi-subagents and its goal-owned tools are optional.",
-		"When an ordinary subagent tool is installed, its calls remain available but are outside the goal-owned ledger. Use goal_subagent only when exact child ownership and output acknowledgement are useful.",
-		"Use the exact goal ID and epoch above in every goal_* call; never search environment variables, session artifacts, or process state for them.",
-		"If goal_subagent or goal_review is used, consider and acknowledge every surfaced output, and explicitly resolve unsuccessful owned outcomes with goal_resolve.",
-		"goal_review is optional advisory evidence, not a completion prerequisite.",
+		"Work directly with ordinary tools whenever useful. Ordinary subagent calls remain available but are outside the goal-owned ledger.",
+		"The goal-owned subagent and review tools are disabled for this upstream provider because it does not enforce the hard child-turn limits required by this goal contract; do not call them.",
+		"Use the exact goal ID and epoch above in every enabled goal_* call; never search environment variables, session artifacts, or process state for them.",
+		"goal_done completes direct-only goals with an empty consideredItemIds list; no review is required.",
 		"Call goal_done with every exact considered goal-owned item ID; use an empty list when no goal-owned work was launched. No review token is required. Prose never completes the goal.",
 		"Automatic-turn and no-progress budgets are enabled by default; token and wall-clock limits are optional.",
 	].join("\n");
@@ -416,8 +421,8 @@ function initialContinuationContent(
 		"Exact identity for every goal_* call (do not search for it elsewhere):",
 		`- goalId: ${snapshot.owner.goalId}`,
 		`- epoch: ${snapshot.owner.epoch}`,
-		"Work directly with ordinary tools. pi-subagents, goal_subagent, and goal_review are optional.",
-		"If goal-owned work is used, acknowledge every surfaced output and resolve unsuccessful outcomes before goal_done. An empty consideredItemIds list is valid when no goal-owned work was launched.",
+		"Work directly with ordinary tools. Ordinary subagent calls remain available outside the goal ledger.",
+		"Goal-owned subagent work and review are disabled for this upstream provider because its child-turn limits cannot be enforced. Do not call goal_subagent or goal_review; use an empty consideredItemIds list with goal_done.",
 	].join("\n");
 }
 
@@ -427,8 +432,6 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	let objective: string | undefined;
 	let currentCtx: ExtensionContext | undefined;
 	let bridge = new SubagentBridge(pi.events);
-	let compatibility: SubagentCompatibility | undefined;
-	let compatibilitySessionId: string | undefined;
 	const outputCache = new Map<string, string>();
 	const statusProviderId = randomUUID();
 	let statusSequence = 0;
@@ -503,24 +506,6 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		}
 		return machine;
 	};
-	const ensureCompatibility = async (ctx: ExtensionContext) => {
-		const identity = sessionIdentity(ctx);
-		if (
-			compatibility?.available &&
-			compatibility.sessionMatches &&
-			compatibilitySessionId === identity.sessionId
-		) {
-			return compatibility;
-		}
-		compatibility = await bridge.probe(identity);
-		compatibilitySessionId = identity.sessionId;
-		if (!compatibility.available || !compatibility.sessionMatches) {
-			throw new SubagentBridgeError(
-				compatibility.reason ?? "The local pi-subagents extension did not answer its stable RPC ping.",
-			);
-		}
-		return compatibility;
-	};
 	const sendContinuation = (content: string, owner: OwnerIdentity, ticket: ContinuationTicket) => {
 		pi.sendMessage(
 			{
@@ -581,7 +566,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 					? ["", "Acknowledgement tokens (never truncated):", ...acknowledgementLines]
 					: []),
 				"Use goal_ack_output after considering every newly surfaced goal-owned output. Resolve unsuccessful owned work explicitly before completion.",
-				"goal_review remains optional. Call goal_done once all goal-owned items are consumed, resolved where needed, and included in consideredItemIds.",
+				"Goal-owned subagent work and review are disabled for this upstream provider. Preserve acknowledgement and explicit resolution for historical owned outputs, then call goal_done with exact considered item IDs (or an empty list for direct-only work).",
 			].join("\n");
 		const previewLimit =
 			outputs.length > 0
@@ -626,17 +611,6 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		}
 	};
 
-	const runner = () =>
-		new GoalSubagentRunner({
-			port: bridge,
-			machine: () => requireMachine(),
-			onOutput: (itemId, output) => outputCache.set(itemId, output),
-			onStateChange: () => {
-				persist();
-				if (currentCtx) dispatchContinuation(currentCtx);
-			},
-		});
-
 	const restore = (event: SessionStartEvent, ctx: ExtensionContext) => {
 		currentCtx = ctx;
 		namespaceFault = undefined;
@@ -648,8 +622,6 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		runningContinuationObserved = false;
 		expectedContinuationNonces.clear();
 		outputCache.clear();
-		compatibility = undefined;
-		compatibilitySessionId = undefined;
 		const commands = pi
 			.getCommands()
 			.filter((command) => command.name === "goal" || /^goal:\d+$/u.test(command.name));
@@ -817,39 +789,19 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		name: "goal_subagent",
 		label: "Goal Subagent",
 		description:
-			"Launch exactly goal-owned pi-subagents work. Foreground single, parallel, and chain modes are supported. Detached mode fails closed until pi-subagents exposes caller-owned completion and atomic continuation coordination.",
+			"Unavailable in this upstream-compatible release: goal-owned pi-subagents work requires hard child-turn limits that the official provider does not enforce.",
 		promptSnippet:
-			"Launch goal-owned foreground pi-subagents work with exact ownership and output acknowledgement",
+			"Goal-owned subagent work is disabled; use ordinary tools or an untracked ordinary subagent.",
 		promptGuidelines: [
-			"goal_subagent is optional; use it only when exact goal ownership and acknowledgement are useful.",
-			"When installed, ordinary subagent remains available but is not tracked by the goal-owned ledger.",
-			"After goal_subagent returns, consider every child output and call goal_ack_output with every exact acknowledgement token.",
+			"Do not call goal_subagent: it rejects before ledger admission and provider dispatch.",
+			"Ordinary subagent remains available but is not tracked by the goal-owned ledger.",
 		],
 		parameters: GoalSubagentSchema,
-		async execute(_toolCallId, params: GoalSubagentInput, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params: GoalSubagentInput, _signal, _onUpdate, ctx) {
 			return serializeGoalTool(async () => {
 				const active = requireMachine(ctx);
 				assertGoalIdentity(active, params.goalId, params.epoch);
-				const installed = await ensureCompatibility(ctx);
-				if ((params.execution ?? "foreground") === "detached") {
-					throw new SubagentBridgeError(
-						installed.goalCoordination
-							? "Detached coordination was advertised, but Pi 0.83.0 still lacks the atomic continuation enqueue needed for the required exactly-once guarantee. Use foreground mode."
-							: "Detached goal-owned work is unavailable: pi-subagents 0.38.1 does not advertise goalCoordination v1 and otherwise queues its own continuation before completion is observable. Use foreground mode.",
-					);
-				}
-				const runParams: GoalSubagentParams = {
-					...(params.agent !== undefined ? { agent: params.agent } : {}),
-					...(params.task !== undefined ? { task: params.task } : {}),
-					...(params.tasks !== undefined ? { tasks: params.tasks } : {}),
-					...(params.chain !== undefined ? { chain: params.chain } : {}),
-					...(params.context !== undefined ? { context: params.context } : {}),
-					...(params.concurrency !== undefined ? { concurrency: params.concurrency } : {}),
-					...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
-					...(params.turnBudget !== undefined ? { turnBudget: params.turnBudget } : {}),
-				};
-				const result = await runner().run(runParams, signal, ctx.cwd);
-				return { content: [{ type: "text", text: result.text }], details: result.details };
+				rejectGoalOwnedWork();
 			});
 		},
 	});
@@ -857,9 +809,9 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "goal_ack_output",
 		label: "Acknowledge Goal Output",
-		description: "Acknowledge exact goal-owned child output only after considering it.",
+		description: "Acknowledge historical goal-owned output only after considering it.",
 		promptGuidelines: [
-			"Call goal_ack_output only with acknowledgement tokens visible in goal_subagent, goal_review, or goal continuation output.",
+			"Call goal_ack_output only for acknowledgement tokens from historical goal-owned output or a goal continuation; new goal_subagent and goal_review calls are disabled.",
 		],
 		parameters: GoalAckSchema,
 		async execute(_toolCallId, params: GoalAckInput, _signal, _onUpdate, ctx) {
@@ -935,54 +887,17 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		name: "goal_review",
 		label: "Goal Review",
 		description:
-			"Optionally run a structured, independent pi-subagents review bound to the current work generation.",
+			"Unavailable in this upstream-compatible release: goal-owned review requires hard child-turn limits that the official provider does not enforce.",
 		promptGuidelines: [
-			"goal_review is optional advisory evidence, not a prerequisite for goal_done.",
-			"Use it only after prior goal-owned output is acknowledged and unsuccessful owned work is explicitly resolved.",
-			"Its output is goal-owned and must be acknowledged before completion.",
+			"Do not call goal_review: it rejects before ledger admission and provider dispatch.",
+			"Direct-only goals do not require an independent review.",
 		],
 		parameters: GoalReviewSchema,
-		async execute(_toolCallId, params: GoalReviewInput, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params: GoalReviewInput, _signal, _onUpdate, ctx) {
 			return serializeGoalTool(async () => {
 				const active = requireMachine(ctx);
 				assertGoalIdentity(active, params.goalId, params.epoch);
-				await ensureCompatibility(ctx);
-				if (!objective) throw new GoalInvariantError("The active goal objective is unavailable.");
-				const review = await runner().review({
-					focus:
-						params.focus ??
-						"Correctness, deterministic races, Pi compatibility, test adequacy, and unresolved blockers.",
-					objective,
-					signal,
-					cwd: ctx.cwd,
-					...(params.agent !== undefined ? { agent: params.agent } : {}),
-					...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
-				});
-				const findings = boundedReviewText({
-					verdict: review.verdict,
-					findings: review.findings,
-					itemId: review.itemId,
-					ackToken: review.ackToken,
-				});
-				const owner = active.snapshot.owner;
-				const details: GoalToolDetails = {
-					version: GOAL_TOOL_DETAILS_VERSION,
-					goalId: owner.goalId,
-					epoch: owner.epoch,
-					lineageId: owner.lineageId,
-					itemIds: [review.itemId],
-					acknowledgements: [{ itemId: review.itemId, ackToken: review.ackToken }],
-					verdict: review.verdict,
-				};
-				return {
-					content: [
-						{
-							type: "text",
-							text: findings,
-						},
-					],
-					details,
-				};
+				rejectGoalOwnedWork();
 			});
 		},
 	});
@@ -991,10 +906,10 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		name: "goal_done",
 		label: "Goal Done",
 		description:
-			"Complete the active goal when enabled budgets remain and every goal-owned item, if any, is terminal, consumed, resolved where needed, and considered. Subagents and review are optional.",
+			"Complete the active direct-only goal when enabled budgets remain and every historical goal-owned item, if any, is terminal, consumed, resolved where needed, and considered.",
 		promptGuidelines: [
 			"No subagent or independent review is required for goal_done.",
-			"Include every goal-owned item ID returned by goal_subagent or goal_review; use an empty list if neither was used.",
+			"Include every historical goal-owned item ID that is being considered; use an empty list for direct-only goals. New goal_subagent and goal_review calls are disabled.",
 		],
 		parameters: GoalDoneSchema,
 		async execute(_toolCallId, params: GoalDoneInput, _signal, _onUpdate, ctx) {
@@ -1031,6 +946,7 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 			!isRecord(event.details)
 		)
 			return;
+		// SAFETY: tool_result details are validated by the owner/version/lineage checks immediately below.
 		const details = event.details as unknown as GoalToolDetails;
 		const owner = machine.snapshot.owner;
 		if (
@@ -1221,8 +1137,6 @@ export default function registerPiSubagentsGoal(pi: ExtensionAPI): void {
 		if (closingEpoch === runtimeEpoch) {
 			bridge.dispose();
 			bridge = new SubagentBridge(pi.events);
-			compatibility = undefined;
-			compatibilitySessionId = undefined;
 			pendingContinuationNonce = undefined;
 			pendingInterruptedTurnUsage = undefined;
 			expectedContinuationNonces.clear();
